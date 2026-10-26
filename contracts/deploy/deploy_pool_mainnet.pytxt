@@ -1,0 +1,2059 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""deploy_pool_mainnet — деплой пула Rubik (КЕ10: части бухгалтерии, ноги, модуль аварии, хранилище) на HyperEVM MAINNET.
+Пишет агент, ЗАПУСКАЕТ ОПЕРАТОР своим одноразовым ключом деплойера. Агент на mainnet ничего не отправляет и ключей не видит.
+
+ЧТО ДЕПЛОИТСЯ. Коммит контракта — ПАРАМЕТР (`--commit`): исходники берутся из истории git (`git archive <commit>`), а не из
+рабочего дерева; дерево сборки проверяется блоб за блобом против коммита (лишний или изменённый файл — отказ); сборка —
+закреплённым `foundry.toml` этого коммита. ПОРЯДОК ДЕПЛОЯ, конструкторы, вычисленный адрес хранилища, манифест и проверка
+после деплоя — ВЛАДЕЛЬЦА этого же коммита (`contracts/diff/pool_ledger_diff.pytxt`: `deploy_pool`, `load_params`,
+`postdeploy_check`). Своего кода деплоя здесь нет — только транспорт: «цепь» владельца, у которой `eth_sendTransaction`
+подписывается ключом в процессе и уходит сырой (`eth_sendRawTransaction` по JSON-RPC; `cast publish` не годится —
+initcode в десятки КБ не влезает в командную строку Windows, WinError 206). Поэтому скрипт годен для ЛЮБОГО коммита, где
+у владельца есть этот API (ред. 9.5 добавила часть PoolLedgerBook — она придёт сама).
+
+КЛЮЧ — только env `HL_MAINNET_DEPLOY_KEY`; переменная удаляется из окружения процесса ПЕРВОЙ строкой `main()` (до любого
+дочернего процесса), в argv не попадает никогда, в журнал и вывод — только адрес. Обращение с секретами — владельца
+(`analysis/e103_pool_money_probe.pytxt` коммита `E103_COMMIT`, ветка work/pool-probe: `Secrets`, `secret_violations`,
+`child_env`, `Evm.sign`, `big_blocks`, `pace`), он грузится из истории git тем же способом, что и контракт.
+Сеть — ЗАМЕРОМ: `eth_chainId` обязан отдать 999 перед любой сетевой командой (на mainnet — только 999; локальный anvil
+selftest'а — только флагом `--selftest-anvil`, только адрес 127.0.0.1 и только chainId != 999).
+
+ПОДКОМАНДЫ (все возобновляемы; журнал — append-only `reports/vault/pool_deploy/<run>/journal.jsonl`):
+  plan     --commit <sha> --params <json> --deployer <адрес> [--run <id>]
+           БЕЗ ключа и без отправки. Проверяет параметры (поимённо), роли на цепи (admin — Safe с кодом, остальные — EOA,
+           попарно различны), nonce деплойера; деплоит ВСЁ на своём anvil от имени деплойера с ТЕМ ЖЕ nonce (адреса CREATE
+           совпадают с mainnet, коды и codehash — тоже), гонит на нём проверку владельца; печатает части, адреса,
+           конструкторы с расшифровкой, хеши кода, газ и сколько HYPE нужно, кого и сколькими USDC активировать на Core.
+  deploy   --run <id>     С ключом. Сводка -> ввод слова DEPLOY -> большие блоки вкл -> части по порядку (перед каждой —
+           nonce = план, оценка газа mainnet <= плану; после — квитанция, адрес = вычисленному, keccak кода = плану) ->
+           большие блоки выкл -> манифест. Повтор после обрыва продолжает с первой незавершённой части.
+  manifest --run <id>     Манифест из журнала + цепи (повтор порядка владельца только чтением): формат `postdeploy`.
+  verify   --run <id>     Только чтение: манифест = восстановленному из цепи, `postdeploy --rpc … --manifest …` владельца,
+           активация на Core. Вердикт PASS/FAIL.
+  sourcify --run <id>     Пакет Sourcify (metadata.json + исходники из git archive) и команды отправки (шлёт оператор).
+  fund-evm --run <id> --hype <X>   С ключом: HYPE деплойера Core -> его же EVM (spotSend на системный адрес HYPE).
+  status   --run <id>     Только чтение: nonce, баланс, большие блоки, прогресс.
+  selftest [--commit <sha> ...] [--static-only]
+
+ИНСТРУКЦИЯ ОПЕРАТОРУ (PowerShell 5.1, из корня этого ворктри):
+
+  0. Подготовка (один раз):
+       cd C:\\tmp\\hlu-deploy
+       $env:HL_FOUNDRY_BIN = "C:/Users/User/Tools/foundry"
+     Safe (admin) создайте на HyperEVM заранее (app.safe.global или аналог для chain 999) — нужен его АДРЕС.
+     guardian — адрес вашего горячего ключа, keeper — адрес ключа бота, treasury — ваш адрес (= guardian только если
+     в параметрах явно "deploy_choices": {"treasury_is_guardian": true}).
+
+  1. Одноразовый ключ деплойера — локально, в файл вне git (печатается только адрес):
+       python -c "from eth_account import Account; a=Account.create(); open(r'C:\\tmp\\pool_deployer.key','w').write(a.key.hex()); print(a.address)"
+       icacls C:\\tmp\\pool_deployer.key /inheritance:r /grant:r "$($env:USERNAME):(R,W)"
+
+  2. Параметры: скопируйте contracts\\deploy\\params.beta.json коммита контракта в, например,
+     C:\\tmp\\params.mainnet.json; впишите адреса ролей и treasury вместо <…>, ставки вместо "TBD".
+
+  3. Счёт деплойера на Core (БЕЗ него большие блоки не включить — «Must deposit before performing actions», а пять из
+     девяти частей тяжелее малого блока 2 млн газа): кнопкой Send в app.hyperliquid.xyz пошлите на адрес деплойера
+     2 USDC (создаёт счёт; комиссия активации 1 USDC — с вас) и HYPE на газ (точную сумму назовёт plan: ~27-28 млн газа
+     × цена большого блока × 1.5 — при нехватке дошлёте до шага 6, deploy сверит баланс сам). plan проверяет
+     coreUserExists(деплойер) и без счёта откажет.
+
+  4. План (без ключа; печатает всё, что уйдёт в сеть, газ каждой части, сколько HYPE нужно, кого активировать):
+       python contracts\\deploy\\deploy_pool_mainnet.pytxt plan --commit <sha контракта> --params C:\\tmp\\params.mainnet.json --deployer <адрес из шага 1>
+     Запомните <run> из вывода. Деплоится КОММИТ, а не рабочее дерево: финальный коммит контракта — сюда.
+
+  5. Газ: HYPE деплойера Core -> его же EVM (сумма — «НУЖНО … HYPE» плана; план считает по цене большого блока ×1.5):
+       $env:HL_MAINNET_DEPLOY_KEY = (Get-Content C:\\tmp\\pool_deployer.key -Raw).Trim()
+       try { python contracts\\deploy\\deploy_pool_mainnet.pytxt fund-evm --run <run> --hype <X> }
+       finally { Remove-Item Env:HL_MAINNET_DEPLOY_KEY -ErrorAction SilentlyContinue }
+
+  6. Деплой (спросит слово DEPLOY; обрыв — просто запустить снова, продолжит):
+       $env:HL_MAINNET_DEPLOY_KEY = (Get-Content C:\\tmp\\pool_deployer.key -Raw).Trim()
+       try { python contracts\\deploy\\deploy_pool_mainnet.pytxt deploy --run <run> }
+       finally { Remove-Item Env:HL_MAINNET_DEPLOY_KEY -ErrorAction SilentlyContinue }
+     ⚠ Между plan и концом deploy ключом деплойера НЕ делать НИЧЕГО другого (сдвиг nonce = хранилище встанет не туда;
+     deploy это ловит до отправки, но части, отправленные ДО сдвига, станут бесхозными).
+
+  7. Активация на Core: кнопкой Send пошлите USDC на КАЖДЫЙ адрес из блока «АКТИВАЦИЯ» вывода deploy/plan — хранилище и
+     каждая нога с долей раздачи > 0 (бета 21.10: legShareBps 5000 — ОБЕ ноги, итого три адреса; по 2 USDC на адрес;
+     комиссию активации 1 USDC Core берёт с ОТПРАВИТЕЛЯ — замер mainnet-пробы e104 A0, 21.10). Полученные суммы лежат на
+     хранилище/ноге незачтённым излишком: возврат с хранилища — `refundDeposit` ключом keeper'а (как стенд e105 `activate`).
+
+  8. Проверка (только чтение; PASS обязателен до первого депозита; --params — ваш файл, sha256 обязан совпасть с деплоем):
+       python contracts\\deploy\\deploy_pool_mainnet.pytxt verify --run <run> --params C:\\tmp\\params.mainnet.json
+
+  9. Sourcify (публикация — ваше решение; пакет — стандартный JSON forge, проверенный пересборкой solc):
+       python contracts\\deploy\\deploy_pool_mainnet.pytxt sourcify --run <run>
+
+  10. Ключ деплойера после деплоя не нужен (он ничем не владеет): остаток HYPE заберите, файл удалите.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from decimal import Decimal
+from importlib.machinery import SourceFileLoader
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+OUT_BASE = os.path.join(ROOT, "reports", "vault", "pool_deploy")
+TREES = os.path.join(OUT_BASE, "_trees")          # дерево коммита на сборку (gitignored, сверяется с коммитом при каждом чтении)
+TOOLS = os.path.join(OUT_BASE, "_tools")          # e103 из истории git (gitignored)
+
+MAINNET = {"name": "mainnet", "chain_id": 999, "evm_rpc": "https://rpc.hyperliquid.xyz/evm",
+           "api_url": "https://api.hyperliquid.xyz", "test": False}
+KEY_ENV = "HL_MAINNET_DEPLOY_KEY"
+CONFIRM_WORD = "DEPLOY"
+PLAN_SCHEMA = "pool_mainnet_deploy_plan_v1"
+RECORD_SCHEMA = "pool_mainnet_deploy_record_v1"
+
+# Владелец обращения с ключом (подпись в процессе, журнал без секретов, окружение детей, большие блоки, пейсинг HL).
+E103_COMMIT = "8612b0bb7538fd55f715bc68b541a8b42b3486a2"     # work/pool-probe: e103 + e104, mainnet-проба 21.10
+E103_PATHS = ("analysis/e103_pool_money_probe.pytxt", "analysis/e96_vault_research_gate.pytxt", "runtime/module_load.pytxt")
+# Что владелец деплоя читает из своего дерева: контракты и свой модуль; foundry-резолвер e96; число владельца для границы
+# очереди (`queue_floor.force_close_source`) и удержания (`hold_bps`). Фикстуры — только selftest (`rehearsal_constants`).
+# Слияние 2026-10-22 (`work/pool-integration`): владелец `contracts/diff/pool_ledger_diff.pytxt` грузит кодек и разбор `dump()`
+# у их владельцев в `runtime/` (вынесены веткой keeper'а, §I.9) — без них дерево коммита владельца не исполнимо
+# (FileNotFoundError на загрузке). `module_load` — загрузчик, которым `pool_ledger_dump` зовёт `evm_abi`.
+TREE_PATHS = ("contracts", "analysis/e96_vault_research_gate.pytxt", "config/operational_limits.json",
+              "runtime/evm_abi.pytxt", "runtime/pool_ledger_dump.pytxt", "runtime/module_load.pytxt")
+SELFTEST_EXTRA = ("tests/fixtures/vault_accounting",)
+TREE_BUILD_DIRS = ("contracts/out", "contracts/cache")       # пишет forge; в коммите их нет
+OWNER_API = ("build", "deploy_pool", "load_params", "postdeploy_check", "create_address", "Chain", "RemoteChain",
+             "rehearsal_core", "min_delay", "queue_max_floor", "max_investors_bound", "MANIFEST_SCHEMA", "EM_TERMS", "BPS",
+             "CORE_USER_EXISTS", "foundry", "config_number", "timelock_kinds", "layout_of")
+
+# Предел газа большого блока HyperEVM: 30 млн (документация HL «Dual-block architecture»; замер e104 A0 21.10 —
+# `block_gas_limit` 30000000 у блока деплоя пробы большим блоком). Часть, чья оценка выше, не поместится НИКОГДА.
+BIG_BLOCK_GAS_LIMIT = 30_000_000
+# Большой блок — раз в минуту (та же документация); ожидание квитанции — 10 больших блоков, дальше — стоп с текстом
+# «запустите deploy снова» (повтор дождётся той же транзакции, а не пошлёт вторую).
+BIG_BLOCK_PERIOD_S = 60
+RECEIPT_WAIT_BLOCKS = 10
+# Активация Core: Send 2 USDC на новый адрес-контракт пришёл ЦЕЛИКОМ, комиссию 1 USDC списали с отправителя (замер mainnet,
+# e104 A0, run_20261021T045241Z: sender 13 -> 10, dest 0 -> 2). Меньшая сумма на mainnet не мерялась.
+ACTIVATION_USDC = Decimal("2")
+ACTIVATION_FEE_USDC = Decimal("1")
+ACTIVATION_RE = re.compile(r"^(\w+) (0x[0-9a-f]{40}) не активирован на Core")   # текст `postdeploy_state` владельца
+CORE_FALSE_STUB = "0x600060005260206000f3"   # anvil плана: coreUserExists = false для всех (кого активировать — судит владелец)
+SAFE_SEL = {"getThreshold()": "e75235b8", "getOwners()": "a0e67e2b"}
+CRASH_ENV = "HL_POOL_DEPLOY_TEST_CRASH_AFTER"  # ТОЛЬКО сеть selftest'а: обрыв после N-й части (проверка возобновления)
+GAS_CUT_ENV = "HL_POOL_DEPLOY_TEST_GAS_CUT"     # ТОЛЬКО сеть selftest'а: часть №N подписывается с половиной газа (OOG в блоке)
+# Малый блок HyperEVM — 2 млн газа (документация HL «Dual-block architecture»): часть выше него идёт только большим блоком.
+SMALL_BLOCK_GAS_LIMIT = 2_000_000
+# Ревью-3 R3-P: НЕЗАВИСИМЫЕ от манифеста и от слагаемых `queue_floor` файла границы сроков. Период расчёта — неделя (расчёт
+# по понедельникам, `monday()`; README «Параметры беты»); запас на окна keeper'а — 2·DELAY (замена keeper'а = реакция +
+# таймлок; та же граница, что конструктор хранилища ставит каждому сроку). Принудительное закрытие и удержание — числа
+# ВЛАДЕЛЬЦА (`config/operational_limits.json` дерева коммита) по ФИКСИРОВАННЫМ ключам, а не по ссылкам из файла параметров.
+SETTLE_PERIOD_D = 7
+FORCE_CLOSE_REF = "config/operational_limits.json:exit_target.profit_target_force_close_d"
+HOLD_REF = "config/operational_limits.json:protection.disaster_sl_pct"
+DAY_S = 86_400
+ROLE_DOC = {
+    "admin": "Safe оператора: таймлок-предложения (keeper/guardian/agent/доля ног/предел адресов/admin), setTvlCap, unpause",
+    "guardian": "горячий ключ оператора: пауза депозитов, отзыв keeper/agent, отмена предложений — только отнимает",
+    "keeper": "ключ бота: зачисление депозитов, расчёты, раздача ногам, выплаты по заявкам, возврат Send",
+    "treasury": "получатель комиссии пула (параметр бухгалтерии, неизменяем)",
+    "deployer": "одноразовый ключ деплоя: после деплоя ничем не владеет",
+}
+
+
+class DeployStop(RuntimeError):
+    """Остановка деплоя: текст говорит, ЧТО случилось и ЧТО делать дальше."""
+
+
+def utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run_id_now() -> str:
+    return datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%SZ")
+
+
+def keccak(data_hex_or_bytes) -> str:
+    from eth_utils import keccak as k
+    b = data_hex_or_bytes if isinstance(data_hex_or_bytes, (bytes, bytearray)) else bytes.fromhex(
+        data_hex_or_bytes[2:] if data_hex_or_bytes.startswith("0x") else data_hex_or_bytes)
+    return "0x" + k(b).hex()
+
+
+def sha256_file(path: str) -> str:
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# --- git: коммит, дерево, целостность ---------------------------------------------------------------------- #
+def git(*a, binary: bool = False):
+    p = subprocess.run(["git", *a], cwd=ROOT, capture_output=True)
+    if p.returncode != 0:
+        raise ValueError(f"git {' '.join(a[:3])}: {p.stderr.decode('utf-8', 'replace')[-600:]}")
+    return p.stdout if binary else p.stdout.decode("utf-8").strip()
+
+
+def resolve_commit(ref: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", ref or ""):
+        raise ValueError(f"--commit: ждали sha коммита (7-40 hex), а не {ref!r} — имя ветки двигается, деплоится коммит")
+    return git("rev-parse", "--verify", f"{ref}^{{commit}}")
+
+
+def ls_tree(commit: str, paths) -> dict:
+    """{путь: sha блоба} коммита по путям; путь, которого в коммите нет, — отказ (владелец ждёт его)."""
+    out = {}
+    for line in git("ls-tree", "-r", "--full-tree", commit, "--", *paths).splitlines():
+        meta, path = line.split("\t", 1)
+        mode, typ, sha = meta.split()
+        if typ != "blob" or mode not in ("100644", "100755"):
+            raise ValueError(f"{commit[:12]}:{path}: {typ} {mode} — дерево сборки ждёт только обычные файлы")
+        out[path] = sha
+    for p in paths:
+        if not any(k == p or k.startswith(p + "/") for k in out):
+            raise ValueError(f"в коммите {commit[:12]} нет пути {p!r} — владелец деплоя его читает")
+    return out
+
+
+def blob_sha(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def tree_problems(commit: str, paths, dest: str) -> list:
+    """Дерево сборки = коммиту БАЙТ В БАЙТ: каждый файл коммита на месте с тем же блобом, лишних файлов под путями нет
+    (лишний .sol в `contracts/src` поменял бы сборку). Каталоги вывода forge (`TREE_BUILD_DIRS`) не судятся."""
+    want = ls_tree(commit, paths)
+    bad = []
+    for p, sha in want.items():
+        f = os.path.join(dest, p)
+        if not os.path.isfile(f):
+            bad.append(f"нет файла {p}")
+        elif blob_sha(open(f, "rb").read()) != sha:
+            bad.append(f"файл {p} не равен блобу коммита")
+    for p in paths:
+        base = os.path.join(dest, p)
+        if not os.path.isdir(base):
+            continue
+        for d, dirs, files in os.walk(base):
+            rel_d = os.path.relpath(d, dest).replace(os.sep, "/")
+            dirs[:] = [x for x in dirs if f"{rel_d}/{x}" not in TREE_BUILD_DIRS]
+            for x in files:
+                rel = f"{rel_d}/{x}"
+                if rel not in want:
+                    bad.append(f"лишний файл {rel}")
+    return bad
+
+
+def extract(commit: str, paths, dest: str) -> str:
+    """`git archive <commit> -- <paths>` в `dest` (tar разбирается в процессе: от `tar.exe` не зависит); существующее
+    дерево не перезаписывается, а СВЕРЯЕТСЯ с коммитом. Расхождение — отказ с перечнем."""
+    if not os.path.isdir(dest) or not all(os.path.exists(os.path.join(dest, p)) for p in paths):
+        blob = git("archive", "--format=tar", commit, "--", *paths, binary=True)
+        os.makedirs(dest, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(blob)) as t:
+            for m in t.getmembers():
+                if m.name.startswith("/") or ".." in m.name.split("/") or not (m.isfile() or m.isdir()):
+                    raise ValueError(f"git archive: член {m.name!r} ({m.type!r}) вне формы дерева")
+            t.extractall(dest, filter="data")
+    bad = tree_problems(commit, paths, dest)
+    if bad:
+        raise ValueError(f"дерево сборки {dest} не равно коммиту {commit[:12]}: {bad[:5]} (всего {len(bad)}) — удалите "
+                         f"каталог, он будет извлечён заново")
+    return dest
+
+
+def tree_of(commit: str, extra=()) -> str:
+    dest = os.path.join(TREES, commit)
+    extract(commit, TREE_PATHS, dest)
+    if extra:
+        extract(commit, tuple(extra), dest)
+    return dest
+
+
+_OWNERS = {}
+
+
+def owner(tree: str):
+    """Модуль владельца деплоя ЭТОГО дерева (`pool_ledger_diff.pytxt`); API, на которое опирается скрипт, — поимённо."""
+    if tree not in _OWNERS:
+        path = os.path.join(tree, "contracts", "diff", "pool_ledger_diff.pytxt")
+        name = "pool_ledger_diff_" + hashlib.sha1(tree.encode()).hexdigest()[:10]
+        D = SourceFileLoader(name, path).load_module()
+        miss = [a for a in OWNER_API if not hasattr(D, a)]
+        if miss:
+            raise ValueError(f"{path}: у владельца нет {miss} — коммит старше API деплоя (нужен ревью-2 и новее)")
+        _OWNERS[tree] = D
+    return _OWNERS[tree]
+
+
+_E103 = []
+
+
+def e103():
+    """Владелец обращения с ключом — e103 коммита `E103_COMMIT`, из истории git (не из чужого рабочего дерева)."""
+    if not _E103:
+        dest = os.path.join(TOOLS, "e103_" + E103_COMMIT[:12])
+        extract(E103_COMMIT, E103_PATHS, dest)
+        p = os.path.join(dest, "analysis", "e103_pool_money_probe.pytxt")
+        _E103.append(sys.modules.get("e103_pool_money_probe") or SourceFileLoader("e103_pool_money_probe", p).load_module())
+    return _E103[0]
+
+
+def forge_version(D) -> str:
+    p = subprocess.run([D.foundry("forge"), "--version"], capture_output=True, text=True, encoding="utf-8")
+    if p.returncode != 0 or not p.stdout.strip():
+        raise ValueError(f"forge --version: {p.stderr[-300:]}")
+    return p.stdout.strip().splitlines()[0]
+
+
+# --- сеть ----------------------------------------------------------------------------------------------------- #
+class NetRpcError(RuntimeError):
+    pass
+
+
+def check_spec(spec: dict) -> dict:
+    """Сеть плана: mainnet — ровно `MAINNET`; сеть selftest'а — только 127.0.0.1 и только chainId != 999."""
+    if not spec.get("test"):
+        if {k: spec.get(k) for k in MAINNET} != MAINNET:
+            raise ValueError(f"сеть {spec} — не mainnet-константы скрипта {MAINNET}")
+        return spec
+    if not re.fullmatch(r"http://127\.0\.0\.1:\d{2,5}", str(spec.get("evm_rpc"))):
+        raise ValueError(f"--selftest-anvil: только http://127.0.0.1:<порт>, а не {spec.get('evm_rpc')!r}")
+    if spec.get("chain_id") == MAINNET["chain_id"]:
+        raise ValueError("--selftest-anvil: chainId 999 — это mainnet; сеть selftest'а обязана иметь свой chainId")
+    return spec
+
+
+class Net:
+    """JSON-RPC сети плана. mainnet — с пейсингом владельца (`e103.pace`, §I.7); повторов нет: отказ RPC = стоп, повтор
+    команды продолжает по журналу."""
+
+    def __init__(self, spec: dict, E=None):
+        self.spec = check_spec(spec)
+        self.url = spec["evm_rpc"]
+        self.E = E
+        self.calls = 0
+
+    def rpc(self, method: str, *params):
+        if not self.spec["test"]:
+            (self.E or e103()).pace()
+        body = json.dumps({"jsonrpc": "2.0", "id": self.calls, "method": method, "params": list(params)}).encode()
+        self.calls += 1
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.load(r)
+        if out.get("error"):
+            raise NetRpcError(f"{method}: {out['error']}")
+        return out["result"]
+
+    def chain_id(self) -> int:
+        return int(self.rpc("eth_chainId"), 16)
+
+    def assert_chain(self) -> int:
+        got = self.chain_id()
+        if got != self.spec["chain_id"]:
+            raise ValueError(f"RPC {self.url} отдал chainId {got}, а план — {self.spec['chain_id']} ({self.spec['name']}): "
+                             f"сеть не та, работа остановлена")
+        if self.spec["test"] == (got == MAINNET["chain_id"]):
+            raise ValueError(f"chainId {got} при test={self.spec['test']}: mainnet — только 999, selftest — только не 999")
+        return got
+
+    def nonce(self, addr: str, tag: str) -> int:
+        return int(self.rpc("eth_getTransactionCount", addr, tag), 16)
+
+    def balance(self, addr: str) -> int:
+        return int(self.rpc("eth_getBalance", addr, "latest"), 16)
+
+    def code(self, addr: str) -> str:
+        return self.rpc("eth_getCode", addr, "latest")
+
+    def gas_price(self) -> int:
+        """Цена большого блока — правило владельца (`e103.Evm.gas_price(big=True)`): eth_bigBlockGasPrice × BIG_PRICE."""
+        if self.spec["test"]:
+            return int(self.rpc("eth_gasPrice"), 16)
+        E = self.E or e103()
+        return int(self.rpc("eth_bigBlockGasPrice"), 16) * E.BIG_PRICE_NUM // E.BIG_PRICE_DEN
+
+    def receipt(self, h: str):
+        return self.rpc("eth_getTransactionReceipt", h)
+
+    def wait_receipt(self, h: str) -> dict:
+        limit = BIG_BLOCK_PERIOD_S * RECEIPT_WAIT_BLOCKS
+        t0 = time.time()
+        while True:
+            rc = self.receipt(h)
+            if rc:
+                return rc
+            if time.time() - t0 > limit:
+                raise DeployStop(f"транзакция {h} отправлена, но не включена за {limit} с. Ничего не делайте ключом "
+                                 f"деплойера; запустите `deploy --run` снова — он дождётся ЭТОЙ транзакции (по журналу), "
+                                 f"а не пошлёт вторую")
+            if self.spec["test"]:
+                time.sleep(0.05)
+
+    def call(self, to: str, data: str) -> str:
+        return self.rpc("eth_call", {"to": to, "data": data}, "latest")
+
+
+# --- журнал ----------------------------------------------------------------------------------------------------- #
+class Journal:
+    """Append-only jsonl прогона. Запись судит владелец (`e103.secret_violations`): поле с именем секрета, 64-hex вне
+    поля-хеша, ФАКТИЧЕСКОЕ значение ключа — отказ записи."""
+
+    def __init__(self, path: str, secrets, E):
+        self.path, self.secrets, self.E = path, secrets, E
+
+    def log(self, event: str, **kw) -> dict:
+        row = {"utc": utc(), "event": event, **kw}
+        bad = self.E.secret_violations(row, self.secrets)
+        if bad:
+            raise ValueError(f"журнал {event}: запись отменена — {bad[:3]}")
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return row
+
+    def rows(self) -> list:
+        if not os.path.isfile(self.path):
+            return []
+        return [json.loads(x) for x in open(self.path, encoding="utf-8") if x.strip()]
+
+    def state(self) -> dict:
+        sent, mined = {}, {}
+        for r in self.rows():
+            if r["event"] == "sent":
+                sent[r["i"]] = r
+            elif r["event"] == "mined" and r["i"] not in mined:
+                mined[r["i"]] = r
+        return {"sent": sent, "mined": mined}
+
+
+def write_json(path: str, obj, secrets=None) -> None:
+    blob = json.dumps(obj, indent=1, ensure_ascii=False)
+    if secrets is not None and secrets.found_in(blob):
+        raise ValueError(f"{path}: запись отменена — в ней значение ключа")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(blob + "\n")
+    os.replace(tmp, path)
+
+
+# --- ключ ----------------------------------------------------------------------------------------------------- #
+def take_key(raw, secrets):
+    """Ключ (уже изъятый из окружения в `main`) -> LocalAccount; значение регистрируется в реестре секретов владельца."""
+    k = (raw or "").strip()
+    if not k:
+        raise ValueError(f"нет env {KEY_ENV} — ключ деплойера подаётся ТОЛЬКО окружением (см. шапку файла, шаг 5)")
+    if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{64}", k):
+        raise ValueError(f"{KEY_ENV} не похож на приватный ключ (ожидалось 64 hex) — значение не печатаю")
+    secrets.add(k)
+    from eth_account import Account
+    return Account.from_key(k if k.startswith("0x") else "0x" + k)
+
+
+# --- параметры --------------------------------------------------------------------------------------------------- #
+def norm_addr(field: str, v) -> str:
+    from eth_utils import is_address, is_checksum_address
+    s = str(v)
+    if s.startswith("<"):
+        raise ValueError(f"{field}: плейсхолдер {s} — впишите адрес")
+    if not is_address(s):
+        raise ValueError(f"{field}: {s!r} — не адрес")
+    body = s[2:]
+    if body != body.lower() and body != body.upper() and not is_checksum_address(s):
+        raise ValueError(f"{field}: {s} — неверная контрольная сумма регистра (EIP-55): опечатка?")
+    return s.lower()
+
+
+def check_params(D, P: dict, doc: dict, deployer: str) -> tuple:
+    """Параметры mainnet поимённо: ставки не TBD; адреса — адреса (EIP-55), попарно различны с деплойером; DELAY >=
+    `MIN_DELAY` исходника; каждый срок >= 2·DELAY; `T_QUEUE_MAX` >= выведенной границы владельца; `max_investors` — число
+    в [1, MAX_INVESTORS_BOUND исходника]; числа бухгалтерии — целые >= 0. Ответ — (roles, constants, choices)."""
+    if P["tbd"]:
+        raise ValueError(f"ledger.{P['tbd'][0]}: TBD — решение оператора не внесено (все TBD: {P['tbd']})")
+    roles = json.loads(json.dumps(P["roles"]))
+    const = json.loads(json.dumps(P["constants"]))
+    for k in ("admin", "keeper", "guardian"):
+        roles[k] = norm_addr(f"roles.{k}", roles[k])
+    const["treasury"] = norm_addr("ledger.treasury", const["treasury"])
+    deployer = norm_addr("--deployer", deployer)
+    delay = roles["delay"]
+    if not isinstance(delay, int) or delay < D.min_delay():
+        raise ValueError(f"vault.delay = {delay} короче MIN_DELAY {D.min_delay()} с исходника PoolVault")
+    for k in D.EM_TERMS:
+        if roles["terms"][k] < 2 * delay:
+            raise ValueError(f"terms.{k} = {roles['terms'][k]} короче 2·DELAY = {2 * delay}")
+    floor, why = D.queue_max_floor(roles)
+    if roles["terms"]["t_queue_max"] < floor:
+        raise ValueError(f"terms.t_queue_max = {roles['terms']['t_queue_max']} короче выведенной границы {floor} ({why})")
+    mi, bound = const.get("max_investors"), D.max_investors_bound()
+    if isinstance(mi, bool) or not isinstance(mi, int) or not 1 <= mi <= bound:
+        raise ValueError(f"ledger.max_investors = {mi!r}: на mainnet — явное число в [1, {bound}] (MAX_INVESTORS_BOUND)")
+    for k, v in const.items():
+        if k in ("treasury", "partners"):
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"ledger.{k} = {v!r}: ждали целое >= 0")
+    if not isinstance(roles["tvl_cap"], int) or roles["tvl_cap"] <= 0:
+        raise ValueError(f"vault.tvl_cap = {roles['tvl_cap']!r}: ждали целое > 0 (микро-USDC)")
+    if not 0 <= roles["leg_share_bps"] <= D.BPS:
+        raise ValueError(f"vault.leg_share_bps = {roles['leg_share_bps']} вне [0, {D.BPS}]")
+    choices = doc.get("deploy_choices", {})
+    if not isinstance(choices, dict) or set(choices) - {"treasury_is_guardian"} or \
+            not all(isinstance(v, bool) for v in choices.values()):
+        raise ValueError(f"deploy_choices: допустим только {{\"treasury_is_guardian\": true|false}}, а не {choices!r}")
+    tig = choices.get("treasury_is_guardian", False)
+    who = {"admin": roles["admin"], "keeper": roles["keeper"], "guardian": roles["guardian"],
+           "treasury": const["treasury"], "deployer": deployer}
+    names = list(who)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if who[a] == who[b] and {a, b} != {"treasury", "guardian"}:
+                raise ValueError(f"роли {a} и {b} — один адрес {who[a]}: роли обязаны быть различны")
+    if (who["treasury"] == who["guardian"]) != tig:
+        raise ValueError(f"deploy_choices.treasury_is_guardian = {tig}, а treasury {'=' if not tig else '!='} guardian — "
+                         f"флаг обязан описывать то, что в параметрах")
+    sem = semantic_problems(D, roles["delay"], roles["terms"], const)
+    if sem:
+        raise ValueError(sem[0] + (f" (и ещё {len(sem) - 1}: {sem[1:]})" if len(sem) > 1 else ""))
+    return roles, const, {"treasury_is_guardian": tig}
+
+
+def semantic_problems(D, delay: int, terms: dict, const: dict) -> list:
+    """Ревью-3 R3-P — смысл сроков и удержания, НЕЗАВИСИМО от манифеста и от слагаемых `queue_floor` файла параметров:
+    T_NOMONDAY > периода расчёта + 2·DELAY (честный пул не замерзает между расчётами); T_QUEUE_MAX >= принудительного
+    закрытия ногой (число владельца по фиксированному ключу) + период расчёта + 2·DELAY; holdBps = катастрофический стоп
+    книги × BPS (число владельца); ставки в [0, BPS]. Пусто — чисто; иначе — расхождения с именами полей."""
+    bad = []
+    nm = SETTLE_PERIOD_D * DAY_S + 2 * delay
+    if not terms["t_nomonday"] > nm:
+        bad.append(f"T_NOMONDAY = {terms['t_nomonday']} не больше периода расчёта {SETTLE_PERIOD_D} сут + 2·DELAY = {nm}")
+    fc = D.config_number(FORCE_CLOSE_REF)
+    qf = int(fc) * DAY_S + SETTLE_PERIOD_D * DAY_S + 2 * delay
+    if terms["t_queue_max"] < qf:
+        bad.append(f"T_QUEUE_MAX = {terms['t_queue_max']} короче {int(fc)} сут закрытия ({FORCE_CLOSE_REF}) + "
+                   f"{SETTLE_PERIOD_D} сут расчёта + 2·DELAY = {qf}")
+    hold = round(D.config_number(HOLD_REF) * D.BPS)
+    if int(const["hold_bps"]) != hold:
+        bad.append(f"holdBps = {const['hold_bps']}, а катастрофический стоп книги ({HOLD_REF}) × BPS = {hold}")
+    for k in ("fee_bps", "ref_share_bps", "open_ref_share_bps", "buffer_bps"):
+        if const.get(k) is not None and not 0 <= int(const[k]) <= D.BPS:
+            bad.append(f"{k} = {const[k]} вне [0, {D.BPS}]")
+    return bad
+
+
+def _words(chain, to: str, a: dict, sig: str, n: int, args: bytes = b"") -> list:
+    """`eth_call` по ABI артефакта: n беззнаковых слов ответа."""
+    out = chain.rpc("eth_call", {"to": to, "data": "0x" + a["methodIdentifiers"][sig] + args.hex()}, "latest")
+    b = bytes.fromhex(out[2:])
+    if len(b) < 32 * n:
+        raise ValueError(f"{sig} по {to}: ответ {len(b)} байт на {n} слов")
+    return [int.from_bytes(b[32 * i: 32 * i + 32], "big") for i in range(n)]
+
+
+def chain_vs_params(chain, D, art, parts: dict, roles: dict, const: dict) -> list:
+    """Ревью-3 R3-P: ЦЕПЬ против ФАЙЛА ПАРАМЕТРОВ (не против манифеста — манифест судит владелец `postdeploy`), независимый
+    смысл сроков и удержания (`semantic_problems` на ПРОЧИТАННЫХ с цепи числах) и изменяемое состояние хранилища после
+    деплоя: депозиты не на паузе, окон ног нет, `legFlow` = 0, заявок нет, отозванного keeper'а нет, предложений таймлока
+    нет (виды — владельца, `timelock_kinds`). `parts` — адреса частей с цепи (восстановленные), а не из файла манифеста."""
+    V, L, EM = parts["PoolVault"], parts["PoolLedger"], parts["PoolVaultEmergency"]
+    va, vw, em = art["vault"], art["views"], art["vault_em"]
+    adr = lambda w: "0x" + f"{w:040x}"
+    one = lambda to, a, sig: _words(chain, to, a, sig, 1)[0]
+    bad = []
+
+    def eq(name, got, want, src):
+        if got != want:
+            bad.append(f"{name} = {got} на цепи, а в файле параметров {src} = {want}")
+    delay = one(V, va, "DELAY()")
+    eq("PoolVault.DELAY()", delay, roles["delay"], "vault.delay")
+    eq("PoolVault.tvlCap()", one(V, va, "tvlCap()"), roles["tvl_cap"], "vault.tvl_cap")
+    eq("PoolVault.legShareBps()", one(V, va, "legShareBps()"), roles["leg_share_bps"], "vault.leg_share_bps")
+    for k in ("admin", "keeper", "guardian"):
+        eq(f"PoolVault.{k}()", adr(one(V, va, f"{k}()")), roles[k], f"roles.{k}")
+    terms = {k: one(EM, em, f"{k.upper()}()") for k in D.EM_TERMS}
+    for k in D.EM_TERMS:
+        eq(f"PoolVaultEmergency.{k.upper()}()", terms[k], roles["terms"][k], f"terms.{k}")
+    p = _words(chain, L, vw, "params()", 8)
+    got = {"treasury": adr(p[1]), "buffer_bps": p[2], "fee_bps": p[3], "ref_share_bps": p[4], "hold_bps": p[5],
+           "open_ref_share_bps": p[6], "partner_term_weeks": p[7]}
+    lim = _words(chain, L, vw, "limits()", 2)
+    got.update(min_deposit=lim[0], max_investors=lim[1])
+    if "max_gens" in const:
+        if "genLimits()" not in vw["methodIdentifiers"]:
+            bad.append("в файле параметров ledger.max_gens, а у бухгалтерии нет genLimits() — коммит не тот")
+        else:
+            got["max_gens"] = _words(chain, L, vw, "genLimits()", 3)[0]
+    names = {"buffer_bps": "bufferBps", "fee_bps": "feeBps", "ref_share_bps": "refShareBps", "hold_bps": "holdBps",
+             "open_ref_share_bps": "openRefShareBps", "partner_term_weeks": "partnerTermWeeks",
+             "min_deposit": "minDeposit", "max_investors": "maxInvestors", "max_gens": "maxGens", "treasury": "treasury"}
+    for k, v in got.items():
+        eq(f"PoolLedger.{names[k]}", v, const[k], f"ledger.{k}")
+    bad += [f"цепь: {x}" for x in semantic_problems(D, delay, terms, got)]
+    if one(V, va, "depositsPaused()") != 0:
+        bad.append("PoolVault.depositsPaused() = true сразу после деплоя")
+    lf = one(V, va, "legFlow()")
+    if lf != 0:
+        bad.append(f"PoolVault.legFlow() = {lf - 2 ** 256 if lf >= 2 ** 255 else lf}, а после деплоя 0")
+    for leg in (0, 1):
+        w = _words(chain, V, va, "windows(uint256)", 4, leg.to_bytes(32, "big"))
+        if any(w):
+            bad.append(f"PoolVault.windows({leg}) = {w}: открытое окно перевода ноги после деплоя")
+    if one(V, va, "nextIntent()") != 0:
+        bad.append("PoolVault.nextIntent() != 0: заявки на вывод после деплоя")
+    if one(V, va, "revokedKeeper()") != 0:
+        bad.append("PoolVault.revokedKeeper() != 0 после деплоя")
+    for k in D.timelock_kinds():
+        if any(_words(chain, V, va, "proposals(uint256)", 2, k.to_bytes(32, "big"))):
+            bad.append(f"PoolVault.proposals({k}) не пусто: висит предложение таймлока")
+    return bad
+
+
+GAS_EVIDENCE = os.path.join(OUT_BASE, "evidence", "gas_hyperevm_vs_anvil.json")
+TESTNET_RPC, TESTNET_CHAIN_ID = "https://rpc.hyperliquid-testnet.xyz/evm", 998
+
+
+def measured_estimator_overhead() -> tuple:
+    """Ревью-3 R3-D: запас газа ИЗ ЗАМЕРА (`measure-gas`): те же транзакции создания частей, что testnet-стенд e105
+    отправил на HyperEVM, повторены на anvil. Газ ИСПОЛНЕНИЯ совпал (иначе отказ — модель «сухой деплой = сеть» ложна), а
+    оценщик HyperEVM даёт больше потраченного: его оценка восстанавливается из лимита транзакции по правилу владельца
+    отправки (`e103`: лимит = оценка × GAS_HEADROOM). Ответ — (max (оценка − потрачено) / потрачено, файл свидетельства)."""
+    from fractions import Fraction
+    E = e103()
+    if not os.path.isfile(GAS_EVIDENCE):
+        raise ValueError(f"нет {GAS_EVIDENCE} — запустите `measure-gas` (замер газа HyperEVM против anvil)")
+    d = json.load(open(GAS_EVIDENCE, encoding="utf-8"))
+    rows = d["rows"]
+    if not rows or any(r["anvil_gas_used"] != r["testnet_gas_used"] or r["anvil_status"] != 1 or not r["same_address"]
+                       for r in rows):
+        raise ValueError(f"{GAS_EVIDENCE}: газ исполнения HyperEVM и anvil разошёлся — сухой деплой не предсказывает сеть")
+    n, dd = E.GAS_HEADROOM_NUM, E.GAS_HEADROOM_DEN
+    r = max(Fraction(-(-r_["testnet_gas_limit"] * dd // n) - r_["testnet_gas_used"], r_["testnet_gas_used"]) for r_ in rows)
+    return r, os.path.relpath(GAS_EVIDENCE, ROOT).replace(os.sep, "/")
+
+
+def cmd_measure_gas(commit: str, manifest: str) -> int:
+    """Только чтение testnet RPC (chainId 998 замером): транзакции создания частей из манифеста testnet-стенда -> повтор
+    их input на anvil от того же отправителя с тем же nonce (адреса и связность те же) -> газ исполнения обеих цепей."""
+    E = e103()
+    D = owner(tree_of(resolve_commit(commit)))
+
+    def rpc(method, *params):
+        E.pace()
+        req = urllib.request.Request(TESTNET_RPC, json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                                                              "params": list(params)}).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.load(r)
+        if out.get("error"):
+            raise NetRpcError(f"{method}: {out['error']}")
+        return out["result"]
+    if int(rpc("eth_chainId"), 16) != TESTNET_CHAIN_ID:
+        raise ValueError(f"{TESTNET_RPC}: chainId не {TESTNET_CHAIN_ID}")
+    m = json.load(open(manifest, encoding="utf-8"))
+    txs = sorted((int(t["nonce"], 16), name, t, rc) for name, p in m["parts"].items()
+                 for t, rc in [(rpc("eth_getTransactionByHash", p["tx"]), rpc("eth_getTransactionReceipt", p["tx"]))])
+    ch = D.Chain()
+    rows = []
+    try:
+        sender = txs[0][2]["from"].lower()
+        ch.rpc("anvil_impersonateAccount", sender)
+        ch.rpc("anvil_setBalance", sender, hex(10 ** 30))
+        for nonce, name, t, rc in txs:
+            ch.rpc("anvil_setNonce", sender, hex(nonce))
+            a = ch.receipt(ch.rpc("eth_sendTransaction", {"from": sender, "data": t["input"], "gas": t["gas"]}))
+            rows.append({"part": name, "nonce": nonce, "tx": t["hash"], "testnet_gas_used": int(rc["gasUsed"], 16),
+                         "testnet_gas_limit": int(t["gas"], 16), "anvil_gas_used": int(a["gasUsed"], 16),
+                         "anvil_status": int(a["status"], 16),
+                         "same_address": a["contractAddress"].lower() == rc["contractAddress"].lower()})
+    finally:
+        ch.close()
+    os.makedirs(os.path.dirname(GAS_EVIDENCE), exist_ok=True)
+    write_json(GAS_EVIDENCE, {"schema": "gas_hyperevm_vs_anvil_v1", "measured_utc": utc(), "testnet_rpc": TESTNET_RPC,
+                              "manifest": os.path.basename(manifest), "anvil_runner_commit": resolve_commit(commit),
+                              "anvil": subprocess.run([D.foundry("anvil"), "--version"], capture_output=True, text=True).stdout.strip().splitlines()[0],
+                              "method": "input тех же транзакций создания, отправитель и nonce те же; лимит testnet = оценка "
+                                        "× e103.GAS_HEADROOM (13/10)", "rows": rows})
+    r, _ = measured_estimator_overhead()
+    print(f"MEASURE-GAS: {len(rows)} частей, газ исполнения HyperEVM = anvil во всех; зазор оценщика HyperEVM r = {float(r):.5f}")
+    return 0
+
+
+def deployer_on_core(net: "Net", D, deployer: str) -> None:
+    """Ревью-3 R3-D: большие блоки включает L1-действие деплойера, а Core отказывает адресу без счёта («Must deposit before
+    performing actions»). Счёт создаёт любой входящий Send (кнопка Send USDC/HYPE на адрес деплойера)."""
+    r = net.call(D.CORE_USER_EXISTS, "0x" + deployer[2:].rjust(64, "0"))
+    if len(r) != 66:
+        raise ValueError(f"coreUserExists({deployer}): прекомпайл {D.CORE_USER_EXISTS} не ответил ({r!r}) — цепь без HyperCore")
+    if int(r, 16) == 0:
+        raise ValueError(f"--deployer {deployer}: нет счёта на Core (coreUserExists = false) — большие блоки ему не включить "
+                         f"(«Must deposit before performing actions»), а {SMALL_BLOCK_GAS_LIMIT:,} газа малого блока частям "
+                         f"не хватает. Пошлите кнопкой Send USDC и HYPE на этот адрес (это создаёт счёт), затем повторите")
+
+
+def safe_info(net: Net, admin: str) -> dict:
+    """admin обязан быть контрактом Safe: есть код, `getThreshold()` в [1, владельцев], `getOwners()` непуст."""
+    if net.code(admin) in ("0x", "0x0", ""):
+        raise ValueError(f"roles.admin {admin}: по адресу нет кода — admin обязан быть Safe (создайте Safe на chain 999)")
+    try:
+        t = int(net.call(admin, "0x" + SAFE_SEL["getThreshold()"]), 16)
+        raw = bytes.fromhex(net.call(admin, "0x" + SAFE_SEL["getOwners()"])[2:])
+        off = int.from_bytes(raw[:32], "big"); n = int.from_bytes(raw[off:off + 32], "big")
+        owners = ["0x" + raw[off + 32 + 32 * i + 12: off + 64 + 32 * i].hex() for i in range(n)]
+    except (NetRpcError, ValueError) as e:
+        raise ValueError(f"roles.admin {admin}: getThreshold()/getOwners() не отвечают как Safe ({e})") from e
+    if not owners or not 1 <= t <= len(owners):
+        raise ValueError(f"roles.admin {admin}: Safe с порогом {t} при владельцах {owners}")
+    return {"threshold": t, "owners": owners}
+
+
+def check_onchain_roles(net: Net, roles: dict, const: dict, deployer: str) -> dict:
+    safe = safe_info(net, roles["admin"])
+    for k, a in (("roles.guardian", roles["guardian"]), ("roles.keeper", roles["keeper"]),
+                 ("ledger.treasury", const["treasury"]), ("--deployer", deployer)):
+        if net.code(a) not in ("0x", "0x0", ""):
+            raise ValueError(f"{k} {a}: по адресу есть код — ждали EOA (ключ человека/бота)")
+    if deployer in [o.lower() for o in safe["owners"]]:
+        raise ValueError(f"--deployer {deployer} — владелец Safe admin'а: деплойер обязан быть одноразовым и ничем не владеть")
+    return safe
+
+
+# --- ABI конструкторов (только статические типы — других у частей нет) -------------------------------------------- #
+def flat_inputs(inputs: list, prefix: str = "") -> list:
+    out = []
+    for x in inputs:
+        name = prefix + (x.get("name") or "?")
+        t = x["type"]
+        if t == "tuple":
+            out += flat_inputs(x["components"], name + ".")
+        elif t.endswith("]") and not t.endswith("[]"):
+            base, n = re.fullmatch(r"(.+)\[(\d+)\]", t).groups()
+            out += flat_inputs([dict(x, name=f"{x.get('name')}[{i}]", type=base) for i in range(int(n))], prefix)
+        elif t in ("string", "bytes") or t.endswith("[]") or t.startswith("tuple"):
+            raise ValueError(f"конструктор: динамический тип {t} ({name}) декодером не поддержан")
+        else:
+            out.append((name, t))
+    return out
+
+
+def decode_args(abi: list, args: bytes) -> list:
+    ctor = [x for x in abi if x.get("type") == "constructor"]
+    fields = flat_inputs(ctor[0]["inputs"]) if ctor else []
+    if len(args) != 32 * len(fields):
+        raise ValueError(f"аргументы конструктора: {len(args)} байт на {len(fields)} статических полей")
+    out = []
+    for i, (name, t) in enumerate(fields):
+        w = args[32 * i: 32 * i + 32]
+        v = "0x" + w[12:].hex() if t == "address" else (bool(int.from_bytes(w, "big")) if t == "bool" else int.from_bytes(w, "big"))
+        out.append({"name": name, "type": t, "value": v})
+    return out
+
+
+def artifacts(art: dict) -> list:
+    """[(ключ, артефакт, (файл, контракт))] сборки владельца: верх и вложенные по ключам."""
+    out = []
+    for k, a in [("", art)] + [(k, v) for k, v in art.items() if isinstance(v, dict) and "bytecode" in v]:
+        (src, name), = a["metadata"]["settings"]["compilationTarget"].items()
+        out.append((k, a, (src, name)))
+    return out
+
+
+def match_artifact(art: dict, data: str):
+    body = data[2:] if data.startswith("0x") else data
+    hits = [(k, a, t) for k, a, t in artifacts(art) if body.startswith(a["bytecode"]["object"][2:])]
+    if not hits:
+        raise ValueError("initcode транзакции не начинается ни с одного артефакта сборки")
+    hits.sort(key=lambda h: -len(h[1]["bytecode"]["object"]))
+    k, a, t = hits[0]
+    return a, t, bytes.fromhex(body[len(a["bytecode"]["object"]) - 2:])
+
+
+# --- сухой деплой на своём anvil -------------------------------------------------------------------------------- #
+class DryChain:
+    """anvil владельца (`D.Chain`: свой chainId, лимит EIP-170 не снят) от имени деплойера с его mainnet-nonce: адрес
+    CREATE зависит только от (отправитель, nonce), поэтому адреса, коды и codehash = mainnet. Газ — `eth_estimateGas`
+    anvil (двоичный поиск: достаточный), им же и отправляется (проверка, что его хватает)."""
+
+    def __init__(self, D, deployer: str, nonce: int):
+        self.a = D.Chain()
+        self.me = deployer.lower()
+        self.txs = []
+        self.a.rpc("anvil_impersonateAccount", self.me)
+        self.a.rpc("anvil_setNonce", self.me, hex(nonce))
+        self.a.rpc("anvil_setBalance", self.me, hex(10 ** 30))
+
+    def rpc(self, method, *params):
+        if method == "eth_sendTransaction":
+            tx = params[0]
+            if tx["from"].lower() != self.me or tx.get("to"):
+                raise ValueError(f"сухой деплой: владелец шлёт не создание от деплойера ({tx.get('from')}, to {tx.get('to')})")
+            q = {"from": self.me, "data": tx["data"] if tx["data"].startswith("0x") else "0x" + tx["data"]}
+            est = int(self.a.rpc("eth_estimateGas", q), 16)
+            h = self.a.rpc("eth_sendTransaction", dict(q, gas=hex(est)))
+            self.txs.append({"data": q["data"], "gas_limit": est, "tx": h})
+            return h
+        return self.a.rpc(method, *params)
+
+    def receipt(self, h):
+        return self.a.receipt(h)
+
+    def close(self):
+        self.a.close()
+
+
+def dry_deploy(D, art, const: dict, roles: dict, deployer: str, nonce: int) -> dict:
+    dc = DryChain(D, deployer, nonce)
+    try:
+        m = D.deploy_pool(dc, art, const, roles)
+        by_addr = {v["address"]: k for k, v in m["parts"].items()}
+        txs = []
+        for i, t in enumerate(dc.txs):
+            rc = dc.receipt(t["tx"])
+            addr = rc["contractAddress"].lower()
+            a, (src, cname), args = match_artifact(art, t["data"])
+            want = D.create_address(deployer, nonce + i)
+            if addr != want:
+                raise ValueError(f"сухой деплой: часть {i} встала на {addr}, а CREATE(деплойер, {nonce + i}) = {want}")
+            txs.append({"i": i, "part": by_addr[addr], "nonce": nonce + i, "address": addr, "source": src,
+                        "contract": cname, "data_hash": keccak(t["data"]), "data_len": (len(t["data"]) - 2) // 2,
+                        "initcode_hash": keccak(a["bytecode"]["object"]), "ctor": decode_args(a["abi"], args),
+                        "gas_estimate": t["gas_limit"], "gas_used": int(rc["gasUsed"], 16),
+                        "code_hash": m["parts"][by_addr[addr]]["codehash"]})
+        if sorted(by_addr.values()) != sorted(t["part"] for t in txs):
+            raise ValueError("сухой деплой: части манифеста владельца не равны транзакциям создания")
+        # Ревью-3 R3-D: газ-лимит = оценка × (1 + r), r — ЗАМЕР этого же сухого деплоя: наибольший по частям зазор оценки
+        # над фактически потраченным (возвраты, 63/64 вложенных вызовов). Запас — того же порядка, что собственный люфт
+        # оценщика на ЭТОМ коде; на сети отправка ещё и требует, чтобы её оценка уложилась в лимит плана.
+        from fractions import Fraction
+        r_dry = max(Fraction(t["gas_estimate"] - t["gas_used"], t["gas_used"]) for t in txs)
+        r_net, src = measured_estimator_overhead()
+        r = max(r_dry, r_net)
+        for t in txs:
+            t["gas_limit"] = -(-t["gas_estimate"] * (r.denominator + r.numerator) // r.denominator)
+        margin = {"r": float(r), "r_dry": float(r_dry), "r_hyperevm_estimator": float(r_net), "evidence": src,
+                  "rule": "gas_limit = ceil(оценка anvil × (1 + r)), r = max(зазор оценки над потраченным: сухой деплой; "
+                          "оценщик HyperEVM по замеру testnet)"}
+        # кого активировать на Core — судит владелец (`postdeploy_state`): прекомпайл «никто не на Core»
+        dc.a.rpc("anvil_setCode", D.CORE_USER_EXISTS, CORE_FALSE_STUB)
+        bad = D.postdeploy_check(dc.a, m, art)
+        act = [ACTIVATION_RE.match(x) for x in bad]
+        other = [x for x, mm in zip(bad, act) if not mm]
+        if other:
+            raise ValueError(f"проверка владельца на сухом деплое: {other}")
+        activation = [{"part": mm.group(1), "address": mm.group(2)} for mm in act]
+        D.rehearsal_core(dc.a)                                    # все на Core -> проверка обязана быть чистой
+        bad2 = D.postdeploy_check(dc.a, m, art)
+        if bad2:
+            raise ValueError(f"проверка владельца на сухом деплое при активированных частях: {bad2}")
+        parts = {k: v["address"] for k, v in m["parts"].items()}
+        bad3 = chain_vs_params(dc.a, D, art, parts, roles, const)
+        if bad3:
+            raise ValueError(f"сухой деплой: цепь против файла параметров: {bad3}")
+        return {"manifest": m, "txs": txs, "activation": activation, "gas_margin": margin}
+    finally:
+        dc.close()
+
+
+# --- прогон: файлы ----------------------------------------------------------------------------------------------- #
+def run_dir(out_base: str, run: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", run or ""):
+        raise ValueError(f"--run {run!r}: имя прогона — [A-Za-z0-9_.-]")
+    return os.path.join(out_base, run)
+
+
+def load_plan(out_base: str, run: str) -> tuple:
+    d = run_dir(out_base, run)
+    p = os.path.join(d, "plan.json")
+    if not os.path.isfile(p):
+        raise ValueError(f"нет {p} — сначала `plan`")
+    plan = json.load(open(p, encoding="utf-8"))
+    if plan.get("schema") != PLAN_SCHEMA:
+        raise ValueError(f"{p}: схема {plan.get('schema')!r}, ждали {PLAN_SCHEMA}")
+    check_spec(plan["network"])
+    return d, plan
+
+
+def open_run(out_base: str, run: str, secrets=None):
+    """(каталог, план, E, D, art, roles, const, journal): дерево сверено с коммитом, сборка — та же, что в плане, параметры
+    — копия плана (sha256), проверены заново."""
+    d, plan = load_plan(out_base, run)
+    E = e103()
+    secrets = secrets or E.Secrets()
+    tree = tree_of(plan["commit"])
+    D = owner(tree)
+    art = D.build()
+    fv = forge_version(D)
+    if fv != plan["forge"]:
+        raise ValueError(f"forge сейчас {fv!r}, в плане {plan['forge']!r} — сборка могла измениться; перепланируйте")
+    pp = os.path.join(d, "params.json")
+    if sha256_file(pp) != plan["params_sha256"]:
+        raise ValueError(f"{pp} изменён после плана (sha256) — параметры деплоя меняются только новым `plan`")
+    roles, const, _ = check_params(D, D.load_params(pp), json.load(open(pp, encoding="utf-8")), plan["deployer"])
+    if roles != plan["roles"] or const != plan["constants"]:
+        raise ValueError("роли/константы, выведенные из параметров сейчас, не равны плану — перепланируйте")
+    for t in plan["txs"]:
+        a = next((a for _, a, tt in artifacts(art) if tt == (t["source"], t["contract"])), None)
+        if a is None or keccak(a["bytecode"]["object"]) != t["initcode_hash"]:
+            raise ValueError(f"сборка {t['contract']} не равна плану (initcode) — дерево/компилятор разошлись")
+    return d, plan, E, D, art, roles, const, Journal(os.path.join(d, "journal.jsonl"), secrets, E), secrets
+
+
+# --- plan ----------------------------------------------------------------------------------------------------------- #
+def cmd_plan(commit: str, params: str, deployer: str, run: str = None, selftest_anvil: str = None,
+             out_base: str = OUT_BASE) -> str:
+    E = e103()
+    commit = resolve_commit(commit)
+    if not os.path.isfile(params):
+        raise ValueError(f"--params: нет файла {params}")
+    if selftest_anvil:
+        spec = {"name": "selftest-anvil", "chain_id": None, "evm_rpc": selftest_anvil, "api_url": None, "test": True}
+        spec["chain_id"] = Net(dict(spec, chain_id=-1), E).chain_id()
+        check_spec(spec)
+    else:
+        spec = dict(MAINNET)
+    net = Net(spec, E)
+    cid = net.assert_chain()
+    run = run or run_id_now()
+    d = run_dir(out_base, run)
+    if os.path.exists(d):
+        raise ValueError(f"прогон {d} уже есть — новый план = новый --run")
+    tree = tree_of(commit)
+    D = owner(tree)
+    print(f"коммит {commit} (дерево {git('rev-parse', commit + '^{tree}')}), сборка {tree} …")
+    art = D.build()
+    fv = forge_version(D)
+    doc = json.load(open(params, encoding="utf-8"))
+    roles, const, choices = check_params(D, D.load_params(params), doc, deployer)
+    deployer = deployer.lower()
+    safe = check_onchain_roles(net, roles, const, deployer)
+    deployer_on_core(net, D, deployer)
+    n_latest, n_pend = net.nonce(deployer, "latest"), net.nonce(deployer, "pending")
+    if n_latest != n_pend:
+        raise ValueError(f"у деплойера {n_pend - n_latest} транзакций в пуле — дождитесь их или возьмите новый ключ")
+    bal = net.balance(deployer)
+    dry = dry_deploy(D, art, const, roles, deployer, n_latest)
+    price = net.gas_price()
+    over = [t for t in dry["txs"] if t["gas_limit"] > BIG_BLOCK_GAS_LIMIT]
+    if over:
+        raise ValueError(f"части {[t['part'] for t in over]}: газ выше предела большого блока {BIG_BLOCK_GAS_LIMIT}")
+    need = sum(t["gas_limit"] for t in dry["txs"]) * price
+    os.makedirs(os.path.join(d, "raw"), exist_ok=True)
+    with open(params, "rb") as src, open(os.path.join(d, "params.json"), "wb") as dst:
+        dst.write(src.read())
+    plan = {"schema": PLAN_SCHEMA, "run": run, "created_utc": utc(), "network": spec, "chain_id_measured": cid,
+            "commit": commit, "tree": git("rev-parse", commit + "^{tree}"), "tree_paths": list(TREE_PATHS), "forge": fv,
+            "e103_commit": E103_COMMIT, "params_file": "params.json", "params_sha256": sha256_file(os.path.join(d, "params.json")),
+            "deployer": deployer, "start_nonce": n_latest, "deployer_balance_wei_at_plan": bal,
+            "roles": roles, "constants": const, "deploy_choices": choices, "safe": safe,
+            "txs": dry["txs"], "dry_manifest": dry["manifest"], "activation": dry["activation"],
+            "gas_margin": dry["gas_margin"],
+            "gas": {"price_wei_at_plan": price, "need_wei_at_plan": need, "big_block_gas_limit": BIG_BLOCK_GAS_LIMIT,
+                    "small_block_gas_limit": SMALL_BLOCK_GAS_LIMIT,
+                    "price_rule": "eth_bigBlockGasPrice × e103.BIG_PRICE" if not spec["test"] else "eth_gasPrice (selftest)"},
+            "partners_after_deploy": const.get("partners", [])}
+    write_json(os.path.join(d, "plan.json"), plan)
+    Journal(os.path.join(d, "journal.jsonl"), E.Secrets(), E).log(
+        "plan", commit=commit, network=spec["name"], deployer=deployer, start_nonce=n_latest, n_parts=len(dry["txs"]),
+        params_hash=plan["params_sha256"], need_wei=need, price_wei=price)
+    print_plan(plan)
+    print(f"\nPLAN: OK — прогон {run} ({d})")
+    return run
+
+
+def hype(wei: int) -> str:
+    return f"{Decimal(wei) / Decimal(10 ** 18):.6f}"
+
+
+def labels(plan: dict) -> dict:
+    lab = {plan["deployer"]: "деплойер", plan["constants"]["treasury"]: "treasury"}
+    for k in ("admin", "keeper", "guardian"):
+        lab[plan["roles"][k]] = k if plan["roles"][k] not in lab else lab[plan["roles"][k]] + "/" + k
+    for t in plan["txs"]:
+        lab[t["address"]] = t["part"] + (" (вычислен, ещё не создан)" if t["part"] == "PoolVault" else "")
+    return lab
+
+
+def print_plan(plan: dict) -> None:
+    lab = labels(plan)
+    r, c = plan["roles"], plan["constants"]
+    print(f"\nСЕТЬ {plan['network']['name']} (chainId {plan['chain_id_measured']}), коммит {plan['commit']}, {plan['forge']}")
+    print(f"ДЕПЛОЙЕР {plan['deployer']}: nonce {plan['start_nonce']}, баланс EVM {hype(plan['deployer_balance_wei_at_plan'])} HYPE")
+    print("\nРОЛИ:")
+    for k in ("admin", "guardian", "keeper"):
+        print(f"  {k:9} {r[k]}  — {ROLE_DOC[k]}")
+    print(f"  {'treasury':9} {c['treasury']}  — {ROLE_DOC['treasury']}")
+    print(f"  Safe admin'а: порог {plan['safe']['threshold']} из {len(plan['safe']['owners'])}: {plan['safe']['owners']}")
+    print(f"\nЧАСТИ ({len(plan['txs'])} транзакций создания, подряд, nonce {plan['start_nonce']}..{plan['start_nonce'] + len(plan['txs']) - 1}):")
+    for t in plan["txs"]:
+        big = " БОЛЬШОЙ БЛОК" if t["gas_limit"] > SMALL_BLOCK_GAS_LIMIT else ""
+        print(f"  {t['i'] + 1:2}. {t['part']:20} nonce {t['nonce']:<4} -> {t['address']}  газ: оценка {t['gas_estimate']:>9,} "
+              f"/ потрачено {t['gas_used']:>9,} / лимит {t['gas_limit']:>9,}{big}  initcode {t['data_len']:>6} Б")
+        print(f"      {t['source']}:{t['contract']}  initcode keccak {t['initcode_hash']}")
+        print(f"      код на цепи (keccak) {t['code_hash']}")
+        for a in t["ctor"]:
+            v = a["value"]
+            note = f"  [{lab[v]}]" if isinstance(v, str) and v in lab else ""
+            print(f"      · {a['name']:22} {a['type']:8} {v}{note}")
+    g = plan["gas"]
+    nbig = sum(t["gas_limit"] > g["small_block_gas_limit"] for t in plan["txs"])
+    print()
+    print(f"ЗАПАС ГАЗА: r = {plan['gas_margin']['r']:.4f} ({plan['gas_margin']['rule']}); выше малого блока "
+          f"{g['small_block_gas_limit']:,}: {nbig} из {len(plan['txs'])} частей => большие блоки обязательны "
+          f"(их включает deploy; деплойер обязан иметь счёт на Core — проверено)")
+    print(f"\nГАЗ: всего {sum(t['gas_limit'] for t in plan['txs']):,} по цене {g['price_wei_at_plan'] / 1e9:.4f} gwei "
+          f"({g['price_rule']}) => НУЖНО {hype(g['need_wei_at_plan'])} HYPE на EVM деплойера (предел большого блока "
+          f"{g['big_block_gas_limit']:,}; цена плавает — deploy сверит баланс по цене момента отправки)")
+    print("\nАКТИВАЦИЯ на Core после деплоя (кнопка Send, USDC; без неё выплаты/раздача — NotActivated, verify — FAIL):")
+    share = plan["roles"]["leg_share_bps"]
+    print(f"  доля раздачи: нога A {share / 100:g} %, нога B {100 - share / 100:g} % — на Core обязаны быть хранилище и "
+          f"{'ОБЕ ноги' if 0 < share < 10_000 else 'нога с ненулевой долей'} (кого именно — судит postdeploy владельца)")
+    for a in plan["activation"]:
+        print(f"  {a['part']:12} {a['address']}  прислать {ACTIVATION_USDC} USDC (+{ACTIVATION_FEE_USDC} USDC комиссии с вас)")
+    tot = len(plan["activation"]) * (ACTIVATION_USDC + ACTIVATION_FEE_USDC)
+    print(f"  итого со счёта отправителя ~{tot} USDC; присланное лежит незачтённым излишком (с хранилища — refundDeposit keeper'а)")
+    if plan["partners_after_deploy"]:
+        print(f"\n⚠ ПАРТНЁРЫ {plan['partners_after_deploy']}: скрипт их не заводит — initPartner транзакцией Safe ДО первой операции")
+    print("\nДо конца deploy ключом деплойера НЕ делать ничего другого: nonce каждой части вычислен заранее.")
+
+
+# --- deploy / manifest: «цепь» владельца ---------------------------------------------------------------------------- #
+class DeployChain:
+    """`chain` для `deploy_pool` владельца поверх сети плана. `eth_sendTransaction` i-й части: данные обязаны совпасть с
+    планом (keccak); часть, уже включённая по журналу, не шлётся заново — её квитанция читается с цепи и судится; новая —
+    подписывается ключом в процессе и уходит `eth_sendRawTransaction`. `eth_getTransactionCount` — nonce, который
+    владелец увидел бы при последовательной отправке (старт плана + отправлено), поэтому повтор после обрыва вычисляет тот
+    же адрес хранилища. mode="replay" — только чтение (манифест): часть, которой нет в журнале, — отказ."""
+
+    def __init__(self, net: Net, plan: dict, j: Journal, mode: str, d: str, acct=None, signer=None):
+        if mode not in ("send", "replay"):
+            raise ValueError(mode)
+        self.net, self.plan, self.j, self.mode, self.d = net, plan, j, mode, d
+        self.acct, self.signer = acct, signer
+        self.me = plan["deployer"]
+        self.i = 0
+        self.rcpts = {}
+        self.st = j.state()
+        self.sent_now = 0
+        crash = os.environ.get(CRASH_ENV)
+        self.crash_after = int(crash) if crash and plan["network"]["test"] else None
+
+    def rpc(self, method, *params):
+        if method == "eth_sendTransaction":
+            return self._create(params[0])
+        if method == "eth_getTransactionCount":
+            if params[0].lower() != self.me or params[1] != "latest":
+                raise ValueError(f"DeployChain: nonce {params} — владелец спрашивает не деплойера")
+            return hex(self.plan["start_nonce"] + self.i)
+        if method in ("eth_chainId", "eth_getCode"):
+            return self.net.rpc(method, *params)
+        raise ValueError(f"DeployChain: метод {method} владельцем деплоя не ожидался")
+
+    def receipt(self, h):
+        return self.rcpts[h]
+
+    def _plan_tx(self, tx: dict) -> dict:
+        i = self.i
+        if i >= len(self.plan["txs"]):
+            raise DeployStop(f"владелец шлёт часть №{i + 1}, а в плане {len(self.plan['txs'])} — дерево не то, что планировали")
+        p = self.plan["txs"][i]
+        data = tx["data"] if tx["data"].startswith("0x") else "0x" + tx["data"]
+        if tx.get("to") or tx["from"].lower() != self.me:
+            raise DeployStop(f"часть {p['part']}: владелец шлёт не создание от деплойера")
+        if keccak(data) != p["data_hash"]:
+            raise DeployStop(f"часть {p['part']}: initcode+конструктор не равны плану (keccak). Ничего не отправлено по ней. "
+                             f"Сборка или параметры разошлись с планом — разберитесь, затем новый `plan` (новым ключом "
+                             f"деплойера, если часть частей уже на цепи)")
+        return p, data
+
+    def _create(self, tx: dict) -> str:
+        p, data = self._plan_tx(tx)
+        i = self.i
+        if i in self.st["mined"]:
+            rc = self._judge(p, self.net.receipt(self.st["mined"][i]["tx"]), log=False)
+        elif self.mode == "replay":
+            raise DeployStop(f"часть {p['part']} (№{i + 1}) по журналу не включена — манифест строится только по "
+                             f"завершённому деплою (`deploy --run` продолжит)")
+        elif i in self.st["sent"]:
+            rc = self._resume_sent(p, i)
+        else:
+            rc = self._send(p, i, data)
+        self.rcpts[rc["transactionHash"]] = rc
+        self.i += 1
+        if self.crash_after is not None and self.sent_now and self.i == self.crash_after:
+            raise DeployStop(f"selftest: обрыв после части №{self.i} ({CRASH_ENV})")
+        return rc["transactionHash"]
+
+    def _nonces(self) -> tuple:
+        return self.net.nonce(self.me, "latest"), self.net.nonce(self.me, "pending")
+
+    def _send(self, p: dict, i: int, data: str) -> dict:
+        want = self.plan["start_nonce"] + i
+        lat, pen = self._nonces()
+        if (lat, pen) != (want, want):
+            raise DeployStop(
+                f"перед частью {p['part']} (№{i + 1}) nonce деплойера latest {lat} / pending {pen}, по плану {want}: ключом "
+                f"деплойера пользовались мимо скрипта. Ничего не отправлено. Если {lat} > {want} — адрес хранилища уже не "
+                f"тот, что вычислен: части, отправленные раньше, бесхозны (денег в них нет); новый ключ деплойера и новый "
+                f"`plan`. Если pending > latest — дождитесь включения и повторите `deploy`.")
+        est = int(self.net.rpc("eth_estimateGas", {"from": self.me, "data": data}), 16)
+        # лимит = max(план, оценка сети): оценка узла достаточна по построению (двоичный поиск на его же состоянии), план —
+        # с запасом из замера; останов по «оценка выше плана» бросил бы деплой ПОСРЕДИ (части до этой — бесхозны)
+        gas = max(p["gas_limit"], est)
+        if gas > BIG_BLOCK_GAS_LIMIT:
+            raise DeployStop(f"часть {p['part']}: оценка газа сети {est:,} выше предела большого блока {BIG_BLOCK_GAS_LIMIT:,} — "
+                             f"на сухом деплое было {p['gas_estimate']:,}. Ничего не отправлено; разберитесь до нового `plan`")
+        price = self.net.gas_price()
+        bal = self.net.balance(self.me)
+        if bal < gas * price:
+            raise DeployStop(f"часть {p['part']}: на EVM деплойера {hype(bal)} HYPE, нужно {hype(gas * price)} по цене "
+                             f"{price} wei. Ничего не отправлено; пополните (`fund-evm`) и повторите `deploy`")
+        cut = os.environ.get(GAS_CUT_ENV)
+        if cut and self.plan["network"]["test"] and int(cut) == i + 1:
+            gas = p["gas_used"] // 2                            # selftest: OOG внутри блока (nonce тратится)
+        raw, h = self.signer.sign(self.acct, None, data, want, gas, price)
+        open(os.path.join(self.d, "raw", f"{i:02d}_{p['part']}.hex"), "w", encoding="utf-8").write(raw)
+        self.j.log("sent", i=i, part=p["part"], nonce=want, tx=h, gas=gas, gas_price=price, estimate=est)
+        got = self.net.rpc("eth_sendRawTransaction", raw)
+        if str(got).lower() != h.lower():
+            raise DeployStop(f"eth_sendRawTransaction вернул {got!r}, а хеш подписанной {h} — повторите `deploy` (он сверит "
+                             f"по журналу, включена ли {h})")
+        self.sent_now += 1
+        return self._judge(p, self.net.wait_receipt(h))
+
+    def _resume_sent(self, p: dict, i: int) -> dict:
+        """Часть отправлена прошлым запуском, исход не записан: квитанция есть — судить; нет и nonce свободен, пул пуст —
+        переслать ТУ ЖЕ подписанную транзакцию (тот же хеш); nonce занят чужим — стоп."""
+        h = self.st["sent"][i]["tx"]
+        rc = self.net.receipt(h)
+        if rc:
+            return self._judge(p, rc)
+        want = self.plan["start_nonce"] + i
+        lat, pen = self._nonces()
+        if lat > want:
+            raise DeployStop(f"часть {p['part']}: nonce {want} занят НЕ транзакцией {h} журнала — ключом пользовались мимо "
+                             f"скрипта; новый ключ деплойера и новый `plan`")
+        if pen == lat:
+            raw = open(os.path.join(self.d, "raw", f"{i:02d}_{p['part']}.hex"), encoding="utf-8").read().strip()
+            got = self.net.rpc("eth_sendRawTransaction", raw)
+            if str(got).lower() != h.lower():
+                raise DeployStop(f"повтор {h}: узел вернул {got!r}")
+            self.j.log("rebroadcast", i=i, part=p["part"], tx=h)
+        return self._judge(p, self.net.wait_receipt(h))
+
+    def _judge(self, p: dict, rc, log: bool = True) -> dict:
+        if not rc:
+            raise DeployStop(f"часть {p['part']}: квитанции нет на цепи, хотя журнал считает её включённой — журнал и цепь "
+                             f"разошлись (не та сеть?)")
+        h = rc["transactionHash"]
+        if int(rc["status"], 16) != 1:
+            used = int(rc["gasUsed"], 16)
+            limit = int(self.net.rpc("eth_getTransactionByHash", h)["gas"], 16)
+            why = (f"КОНЧИЛСЯ ГАЗ (потрачено {used:,} = лимиту {limit:,})" if used >= limit
+                   else f"откат конструктора (потрачено {used:,} из {limit:,})")
+            if log:
+                self.j.log("failed", i=self.i, part=p["part"], tx=h, gas_used=used, gas=limit, out_of_gas=used >= limit)
+            raise DeployStop(f"часть {p['part']} (№{self.i + 1}) ОТКАТИЛАСЬ — {why}; tx {h}, блок {int(rc['blockNumber'], 16)}. "
+                             f"Nonce {self.plan['start_nonce'] + self.i} ПОТРАЧЕН: адреса следующих частей и вычисленный адрес "
+                             f"хранилища уже не те, следующую часть скрипт НЕ отправит (и при повторе тоже). Денег в частях нет. "
+                             f"Дальше: разобрать причину (`cast run {h}`), новый ключ деплойера, новый `plan`")
+        addr = (rc.get("contractAddress") or "").lower()
+        if addr != p["address"]:
+            raise DeployStop(f"часть {p['part']} встала на {addr}, а вычислен {p['address']} (tx {h}) — порядок нарушен; "
+                             f"новый ключ деплойера и новый `plan`")
+        ch = keccak(self.net.code(addr))
+        if ch != p["code_hash"]:
+            raise DeployStop(f"часть {p['part']} {addr}: keccak кода на цепи {ch}, по плану {p['code_hash']} — НЕ ПОЛЬЗОВАТЬСЯ "
+                             f"пулом; разобрать (код сборки vs цепь) до любых денег")
+        if log:
+            self.j.log("mined", i=self.i, part=p["part"], tx=h, block=int(rc["blockNumber"], 16),
+                       gas_used=int(rc["gasUsed"], 16), address=addr, code_hash=ch)
+        return rc
+
+
+class BigBlocks:
+    """Большие блоки деплойера — владельца (`e103.big_blocks`: пул пуст, переключение SDK, подтверждение чтением
+    `eth_usingBigBlocks`). Сеть selftest'а их не знает — пропуск с записью в журнал."""
+
+    def __init__(self, plan: dict, j: Journal, acct, E, d: str):
+        self.plan, self.j, self.acct, self.E = plan, j, acct, E
+        self.c = None
+        if not plan["network"]["test"]:
+            from hyperliquid.utils import constants
+            if MAINNET["api_url"] != constants.MAINNET_API_URL:
+                raise ValueError("api_url скрипта не равен SDK MAINNET_API_URL")
+            net = {k: MAINNET[k] for k in ("name", "chain_id", "evm_rpc", "api_url")}
+            self.c = E.Ctx(net=net, out=os.path.join(d, "e103"))
+            self.c.evm.assert_chain()
+
+    def using(self) -> bool:
+        return False if self.c is None else self.c.evm.using_big_blocks(self.acct.address)
+
+    def set(self, enable: bool) -> None:
+        if self.c is None:
+            self.j.log("big_blocks", enable=enable, skipped="сеть selftest'а: больших блоков нет")
+            return
+        r = self.E.big_blocks(self.c, self.acct, enable)
+        self.j.log("big_blocks", enable=enable, confirmed=r["confirmed"], latency_s=r["latency_s"])
+
+
+def manifest_of(m: dict, plan: dict, j: Journal) -> dict:
+    """Манифест владельца (`deploy_pool`: схема, chain_id, деплойер, nonce хранилища, константы, роли, части с codehash) +
+    запись деплоя (коммит, параметры, транзакции). Детерминирован по журналу и цепи."""
+    st = j.state()["mined"]
+    out = json.loads(json.dumps(m))
+    out["deploy"] = {"schema": RECORD_SCHEMA, "run": plan["run"], "network": plan["network"]["name"],
+                     "commit": plan["commit"], "tree": plan["tree"], "forge": plan["forge"],
+                     "params_sha256": plan["params_sha256"],
+                     "txs": {st[i]["part"]: {"tx": st[i]["tx"], "block": st[i]["block"], "gas_used": st[i]["gas_used"],
+                                             "nonce": plan["start_nonce"] + i} for i in sorted(st)},
+                     "deployed_utc": max(st[i]["utc"] for i in st)}
+    return out
+
+
+def compare_to_plan(m: dict, plan: dict) -> list:
+    dm = plan["dry_manifest"]
+    bad = []
+    for k in ("deployer", "vault_nonce", "constants", "roles", "schema"):
+        if m.get(k) != dm.get(k):
+            bad.append(f"{k}: {m.get(k)!r} против плана {dm.get(k)!r}")
+    if m["parts"] != dm["parts"]:
+        bad.append(f"части: {m['parts']} против плана {dm['parts']}")
+    if m["chain_id"] != plan["chain_id_measured"]:
+        bad.append(f"chain_id {m['chain_id']} против {plan['chain_id_measured']}")
+    return bad
+
+
+def regenerate(d, plan, D, art, net, j) -> dict:
+    m = D.deploy_pool(DeployChain(net, plan, j, "replay", d), art, plan["constants"], plan["roles"])
+    return manifest_of(m, plan, j)
+
+
+def cmd_deploy(run: str, raw_key, out_base: str = OUT_BASE, input_fn=input) -> int:
+    E = e103()
+    secrets = E.Secrets()
+    acct = take_key(raw_key, secrets)
+    d, plan, E, D, art, roles, const, j, secrets = open_run(out_base, run, secrets)
+    if acct.address.lower() != plan["deployer"]:
+        raise ValueError(f"ключ даёт адрес {acct.address}, а деплойер плана {plan['deployer']} — не тот ключ")
+    net = Net(plan["network"], E)
+    net.assert_chain()
+    st = j.state()
+    n = len(plan["txs"])
+    done = len(st["mined"])
+    lat, pen = net.nonce(plan["deployer"], "latest"), net.nonce(plan["deployer"], "pending")
+    outstanding = [i for i in st["sent"] if i not in st["mined"]]
+    if pen > lat and outstanding:
+        print(f"в пуле деплойера транзакция журнала {st['sent'][outstanding[0]]['tx']} — жду включения …")
+        net.wait_receipt(st["sent"][outstanding[0]]["tx"])
+        lat, pen = net.nonce(plan["deployer"], "latest"), net.nonce(plan["deployer"], "pending")
+    remaining = n - done
+    landed = 0
+    for i in outstanding:                                     # отправлена прошлым запуском, исход не записан
+        rc = net.receipt(st["sent"][i]["tx"])
+        if rc and int(rc["status"], 16) != 1:
+            p = plan["txs"][i]
+            raise DeployStop(f"часть {p['part']} (№{i + 1}) прошлого запуска ОТКАТИЛАСЬ (tx {rc['transactionHash']}, потрачено "
+                             f"{int(rc['gasUsed'], 16):,} газа): nonce {plan['start_nonce'] + i} потрачен, вычисленные адреса "
+                             f"дальше неверны — следующая часть не будет отправлена. Новый ключ деплойера и новый `plan`")
+        landed += bool(rc)
+    if remaining and (lat, pen) != (plan["start_nonce"] + done + landed,) * 2:
+        raise DeployStop(f"nonce деплойера latest {lat} / pending {pen}, а по журналу следующая часть №{done + 1} — nonce "
+                         f"{plan['start_nonce'] + done}: ключом пользовались мимо скрипта. Ничего не отправлено. "
+                         f"{'Части, отправленные раньше, бесхозны (денег в них нет). ' if done else ''}Новый ключ деплойера "
+                         f"и новый `plan` (если pending > latest — дождитесь включения и повторите `deploy`).")
+    if remaining:
+        deployer_on_core(net, D, plan["deployer"])          # R3-D: без счёта на Core большие блоки не включить
+    big = BigBlocks(plan, j, acct, E, d)
+    signer = E.Evm({k: plan["network"][k] for k in ("name", "chain_id", "evm_rpc", "api_url")},
+                   E.make_runner(secrets), secrets)
+    if remaining:
+        price = net.gas_price()
+        need = sum(t["gas_limit"] for t in plan["txs"][done:]) * price
+        bal = net.balance(plan["deployer"])
+        print(f"\nДЕПЛОЙ {plan['network']['name']} chainId {plan['chain_id_measured']}, коммит {plan['commit']}")
+        print(f"деплойер {plan['deployer']}: nonce {lat}, баланс {hype(bal)} HYPE, нужно ~{hype(need)} HYPE "
+              f"(цена {price / 1e9:.4f} gwei)")
+        print(f"admin(Safe) {roles['admin']}  guardian {roles['guardian']}  keeper {roles['keeper']}  "
+              f"treasury {const['treasury']}")
+        for t in plan["txs"][done:]:
+            print(f"  {t['i'] + 1:2}. {t['part']:20} nonce {t['nonce']} -> {t['address']}  газ {t['gas_limit']:,}")
+        if done:
+            print(f"  (уже на цепи по журналу: {done} из {n} — продолжение)")
+        if bal < need:
+            raise DeployStop(f"на EVM деплойера {hype(bal)} HYPE, а нужно {hype(need)} — пополните (`fund-evm`) и повторите")
+        word = input_fn(f"\nОтправить {remaining} транзакций в {plan['network']['name']}? Введите {CONFIRM_WORD}: ")
+        if (word or "").strip() != CONFIRM_WORD:
+            j.log("abort", reason="подтверждение не получено", parts_left=remaining)
+            print("ОТМЕНЕНО: ничего не отправлено")
+            return 2
+        j.log("confirmed", parts_left=remaining, start_nonce_now=lat)
+    err = None
+    try:
+        if remaining:
+            big.set(True)
+        m = D.deploy_pool(DeployChain(net, plan, j, "send", d, acct=acct, signer=signer), art, const, roles)
+    except BaseException as e:
+        err = e
+        raise
+    finally:
+        if remaining or big.using():
+            try:
+                big.set(False)
+            except Exception as e2:                            # громко: не глотается, а печатается и пишется
+                j.log("big_blocks_off_failed", error=secrets.scrub(str(e2))[:400])
+                print(f"⚠ БОЛЬШИЕ БЛОКИ НЕ ВЫКЛЮЧЕНЫ: {secrets.scrub(str(e2))[:300]} — повторите `deploy --run {run}` "
+                      f"(при завершённом деплое он только выключит их)")
+                if err is None:
+                    raise
+    bad = compare_to_plan(m, plan)
+    if bad:
+        raise DeployStop(f"деплой завершён, но манифест не равен плану: {bad} — НЕ пользоваться пулом до разбора")
+    mf = manifest_of(m, plan, j)
+    mp = os.path.join(d, "manifest.json")
+    write_json(mp, mf, secrets)
+    j.log("deployed", vault=m["parts"]["PoolVault"]["address"], manifest_hash=sha256_file(mp))
+    print(f"\nDEPLOY: OK — хранилище {m['parts']['PoolVault']['address']}, манифест {mp}")
+    print_activation(plan)
+    print(f"Дальше: активация (выше), затем `verify --run {run}`; `sourcify --run {run}`.")
+    return 0
+
+
+def print_activation(plan: dict) -> None:
+    print("АКТИВАЦИЯ на Core (кнопка Send, USDC, со своего счёта):")
+    for a in plan["activation"]:
+        print(f"  {a['part']:12} {a['address']}  {ACTIVATION_USDC} USDC (+{ACTIVATION_FEE_USDC} комиссии с отправителя)")
+
+
+def cmd_manifest(run: str, out_base: str = OUT_BASE) -> int:
+    d, plan, E, D, art, roles, const, j, secrets = open_run(out_base, run)
+    net = Net(plan["network"], E)
+    net.assert_chain()
+    mf = regenerate(d, plan, D, art, net, j)
+    bad = compare_to_plan(mf, plan)
+    if bad:
+        raise DeployStop(f"манифест с цепи не равен плану: {bad}")
+    mp = os.path.join(d, "manifest.json")
+    if os.path.isfile(mp):
+        diff = leaf_diff(json.load(open(mp, encoding="utf-8")), mf)
+        if diff:
+            raise DeployStop(f"{mp} не равен восстановленному из журнала и цепи: {diff[:5]} — файл правили руками? "
+                             f"Удалите его, `manifest` запишет заново")
+        print(f"MANIFEST: {mp} равен восстановленному")
+        return 0
+    write_json(mp, mf, secrets)
+    j.log("manifest", manifest_hash=sha256_file(mp))
+    print(f"MANIFEST: записан {mp}")
+    return 0
+
+
+# --- verify ---------------------------------------------------------------------------------------------------- #
+def leaves(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from leaves(v, f"{p}.{k}" if p else str(k))
+    elif isinstance(o, list) and o:
+        for i, v in enumerate(o):
+            yield from leaves(v, f"{p}[{i}]")
+    else:
+        yield p, o
+
+
+def leaf_diff(a, b) -> list:
+    la, lb = dict(leaves(a)), dict(leaves(b))
+    return [f"{k}: {la.get(k)!r} против {lb.get(k)!r}" for k in sorted(set(la) | set(lb)) if la.get(k) != lb.get(k)]
+
+
+def activation_table(net: Net, D, plan: dict) -> list:
+    out = []
+    for a in plan["activation"]:
+        r = net.call(D.CORE_USER_EXISTS, "0x" + a["address"][2:].rjust(64, "0"))
+        out.append((a["part"], a["address"], None if len(r) != 66 else int(r, 16) != 0))
+    return out
+
+
+def cmd_verify(run: str, out_base: str = OUT_BASE, params_file: str = None) -> int:
+    d, plan, E, D, art, roles, const, j, secrets = open_run(out_base, run)
+    net = Net(plan["network"], E)
+    cid = net.assert_chain()
+    mp = os.path.join(d, "manifest.json")
+    if not os.path.isfile(mp):
+        raise ValueError(f"нет {mp} — сначала `deploy` (или `manifest`)")
+    mf = json.load(open(mp, encoding="utf-8"))
+    regen = regenerate(d, plan, D, art, net, j)
+    bad = [f"манифест: {x}" for x in leaf_diff(mf, regen)]
+    if mf.get("chain_id") != cid:
+        bad.append(f"chain_id манифеста {mf.get('chain_id')} — не цепь {cid}")
+    # R3-P: манифест привязан к файлу параметров (sha256), и манифест, и ЦЕПЬ сверяются с этим файлом напрямую
+    sha = sha256_file(os.path.join(d, "params.json"))         # = плану (open_run), иначе отказ раньше
+    if (mf.get("deploy") or {}).get("params_sha256") != sha:
+        bad.append(f"манифест: deploy.params_sha256 {(mf.get('deploy') or {}).get('params_sha256')} — не sha256 файла "
+                   f"параметров прогона {sha}")
+    if params_file is not None and sha256_file(params_file) != sha:
+        bad.append(f"файл параметров {params_file}: sha256 {sha256_file(params_file)} — не тот, по которому деплоили ({sha})")
+    for k in sorted(set(roles) | set(mf.get("roles", {}))):
+        if mf.get("roles", {}).get(k) != roles.get(k):
+            bad.append(f"манифест: roles.{k} = {mf.get('roles', {}).get(k)!r}, а файл параметров даёт {roles.get(k)!r}")
+    for k in sorted(mf.get("constants", {})):
+        if mf["constants"][k] != const.get(k):
+            bad.append(f"манифест: constants.{k} = {mf['constants'][k]!r}, а файл параметров даёт {const.get(k)!r}")
+    bad += chain_vs_params(net, D, art, {k: v["address"] for k, v in regen["parts"].items()}, roles, const)
+    tree = tree_of(plan["commit"])
+    cmd = [sys.executable, os.path.join(tree, "contracts", "diff", "pool_ledger_diff.pytxt"), "postdeploy",
+           "--rpc", plan["network"]["evm_rpc"], "--manifest", mp] + (["--spacing", "0"] if plan["network"]["test"] else [])
+    print("postdeploy владельца:", " ".join(cmd[1:]))
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=E.child_env())
+    print(p.stdout.rstrip())
+    if p.returncode != 0:
+        bad.append(f"postdeploy владельца rc={p.returncode}" + (f": {p.stderr.strip()[-600:]}" if p.stderr.strip() else ""))
+    print("\nактивация на Core (coreUserExists):")
+    for part, addr, ok in activation_table(net, D, plan):
+        print(f"  {part:12} {addr}  {'да' if ok else ('НЕТ — пришлите ' + str(ACTIVATION_USDC) + ' USDC (Send)') if ok is False else 'проверить нечем (нет прекомпайла)'}")
+        if not ok:
+            bad.append(f"{part} {addr}: coreUserExists = {ok} — активация на Core обязательна до первой раздачи/выплаты")
+    for x in bad:
+        print("   ", x)
+    verdict = "PASS" if not bad else "FAIL"
+    j.log("verify", verdict=verdict, n_bad=len(bad), postdeploy_rc=p.returncode)
+    print(f"VERIFY: {verdict} (прогон {run}, цепь {cid})")
+    return 0 if not bad else 1
+
+
+# --- sourcify ------------------------------------------------------------------------------------------------------ #
+def solc_path(version: str) -> str:
+    """solc, которым собирал forge (svm): Windows — %APPDATA%/svm, Linux/macOS — ~/.svm. Нет — отказ."""
+    v = version.split("+")[0]
+    cands = [os.path.join(os.environ.get("APPDATA", ""), "svm", v, f"solc-{v}"),
+             os.path.join(os.environ.get("APPDATA", ""), "svm", v, f"solc-{v}.exe"),
+             os.path.expanduser(os.path.join("~", ".svm", v, f"solc-{v}"))]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    raise ValueError(f"solc {v} не найден ({cands}) — сначала `forge build` дерева коммита")
+
+
+def std_json_input(D, tree: str, addr: str, src: str, contract: str) -> dict:
+    """Стандартный JSON компилятора ровно таким, каким его отдаёт forge (`verify-contract --show-standard-json-input`,
+    без сети): исходники в нём — тот текст, что видел solc (замер 21.10: у 14 файлов с CRLF в git — LF)."""
+    p = subprocess.run([D.foundry("forge"), "verify-contract", "--show-standard-json-input", addr, f"{src}:{contract}"],
+                       cwd=os.path.join(tree, "contracts"), capture_output=True, text=True, encoding="utf-8",
+                       env=e103().child_env())
+    if p.returncode != 0:
+        raise ValueError(f"forge verify-contract --show-standard-json-input {src}:{contract}: {p.stderr[-800:]}")
+    return json.loads(p.stdout)
+
+
+def std_json_problems(sj: dict, a: dict, solc: str, src: str, contract: str) -> list:
+    """Ревью-3 R3-S: стандартный JSON годен для Sourcify, только если (1) его исходники — ровно набор метаданных сборки и
+    keccak256 КАЖДОГО = метаданным; (2) solc на нём даёт байт в байт initcode и метаданные артефакта (тогда и хвост кода с
+    хешем метаданных совпадёт)."""
+    md = json.loads(a["rawMetadata"])
+    bad = []
+    if set(sj["sources"]) != set(md["sources"]):
+        bad.append(f"исходники стандартного JSON {sorted(set(sj['sources']) ^ set(md['sources']))[:5]} не равны метаданным")
+    for k, info in md["sources"].items():
+        c = (sj["sources"].get(k) or {}).get("content")
+        if c is None or keccak(c.encode("utf-8")) != info["keccak256"]:
+            bad.append(f"{k}: keccak256 исходника стандартного JSON не равен метаданным сборки")
+    q = json.loads(json.dumps(sj))
+    q["settings"]["outputSelection"] = {"*": {"*": ["evm.bytecode.object", "metadata"]}}
+    r = subprocess.run([solc, "--standard-json"], input=json.dumps(q), capture_output=True, text=True, encoding="utf-8")
+    out = json.loads(r.stdout or "{}")
+    errs = [e.get("formattedMessage", e.get("message", ""))[:200] for e in out.get("errors", []) if e.get("severity") == "error"]
+    if r.returncode != 0 or errs:
+        return bad + [f"solc на стандартном JSON: rc {r.returncode}, {errs[:2]}"]
+    c = out["contracts"][src][contract]
+    if "0x" + c["evm"]["bytecode"]["object"] != a["bytecode"]["object"]:
+        bad.append(f"{contract}: solc на стандартном JSON дал initcode, не равный сборке")
+    if c["metadata"] != a["rawMetadata"]:
+        bad.append(f"{contract}: solc на стандартном JSON дал метаданные, не равные сборке")
+    return bad
+
+
+def cmd_sourcify(run: str, out_base: str = OUT_BASE) -> int:
+    """Ревью-3 R3-S: пакет на часть — стандартный JSON из forge (а не исходники по байтам архива: keccak исходников в
+    метаданных — по тексту, который видел solc, а 14 файлов `lib/hyper-evm-lib` в git — CRLF), проверенный: keccak
+    каждого исходника = метаданным, solc на нём = initcode и метаданные сборки. request.json — тело API Sourcify v2.
+    Отправка — публикация исходников: делает оператор."""
+    d, plan, E, D, art, roles, const, j, secrets = open_run(out_base, run)
+    mp = os.path.join(d, "manifest.json")
+    if not os.path.isfile(mp):
+        raise ValueError(f"нет {mp}")
+    mf = json.load(open(mp, encoding="utf-8"))
+    tree = tree_of(plan["commit"])
+    base = os.path.join(d, "sourcify")
+    cmds, checked, crlf = [], {}, set()
+    for t in plan["txs"]:
+        key = (t["source"], t["contract"])
+        a = next(a for _, a, tt in artifacts(art) if tt == key)
+        md = json.loads(a["rawMetadata"])
+        addr = mf["parts"][t["part"]]["address"]
+        if key not in checked:
+            sj = std_json_input(D, tree, addr, *key)
+            bad = std_json_problems(sj, a, solc_path(md["compiler"]["version"]), *key)
+            if bad:
+                raise ValueError(f"Sourcify {t['part']}: {bad}")
+            checked[key] = sj
+            for s_, info in md["sources"].items():
+                if keccak(open(os.path.join(tree, "contracts", s_), "rb").read()) != info["keccak256"]:
+                    crlf.add(s_)
+        pdir = os.path.join(base, t["part"])
+        os.makedirs(pdir, exist_ok=True)
+        write_json(os.path.join(pdir, "std_input.json"), checked[key])
+        req = {"stdJsonInput": checked[key], "compilerVersion": md["compiler"]["version"],
+               "contractIdentifier": f"{t['source']}:{t['contract']}",
+               "creationTransactionHash": mf["deploy"]["txs"][t["part"]]["tx"]}
+        rp = os.path.join(pdir, "request.json")
+        write_json(rp, req)
+        cmds.append((t["part"], addr, rp, t))
+    j.log("sourcify", parts=len(cmds), contracts=len(checked), crlf_in_git=len(crlf))
+    print(f"Пакеты Sourcify: {base} — стандартный JSON forge по {len(checked)} контрактам: keccak каждого исходника = "
+          f"метаданным, solc {md['compiler']['version']} на нём = initcode и метаданные сборки")
+    if crlf:
+        print(f"  ⚠ {len(crlf)} исходников в git с CRLF, а solc получил их в LF (так их и несёт стандартный JSON). Байты "
+              f"архива для Sourcify НЕ годятся; сборка forge на ОС без этой нормализации — не проверена")
+    print("\nОтправка (PowerShell, по одной на часть; это ПУБЛИКАЦИЯ исходников):")
+    for part, addr, rp, t in cmds:
+        print(f"  Invoke-RestMethod -Method Post -Uri https://sourcify.dev/server/v2/verify/{mf['chain_id']}/{addr} "
+              f"-ContentType 'application/json' -InFile '{rp}'   # {part}")
+    print("  статус: Invoke-RestMethod https://sourcify.dev/server/v2/verify/<verificationId из ответа>")
+    print("\nПоддержку chain 999 у Sourcify проверьте заранее: https://sourcify.dev/server/chains")
+    return 0
+
+
+# --- fund-evm / status -------------------------------------------------------------------------------------------- #
+def cmd_fund_evm(run: str, amount: str, raw_key, out_base: str = OUT_BASE) -> int:
+    E = e103()
+    secrets = E.Secrets()
+    acct = take_key(raw_key, secrets)
+    d, plan = load_plan(out_base, run)
+    if plan["network"]["test"]:
+        raise ValueError("fund-evm: у сети selftest'а нет Core")
+    if acct.address.lower() != plan["deployer"]:
+        raise ValueError(f"ключ даёт {acct.address}, а деплойер плана {plan['deployer']}")
+    x = Decimal(str(amount))
+    if x <= 0:
+        raise ValueError(f"--hype {x} <= 0")
+    j = Journal(os.path.join(d, "journal.jsonl"), secrets, E)
+    net = {k: MAINNET[k] for k in ("name", "chain_id", "evm_rpc", "api_url")}
+    c = E.Ctx(net=net, out=os.path.join(d, "e103"))
+    c.evm.assert_chain()
+    core = E.spot_total(c.info, acct.address, "HYPE")
+    if x > core:
+        raise ValueError(f"--hype {x} больше HYPE деплойера на Core ({core}) — сначала Send с вашего счёта")
+    t = c.token("HYPE")
+    dest = E.e96().token_system_address(t)
+    e0 = c.evm.balance(acct.address)
+    res = c.exchange(acct).spot_transfer(float(x), dest, f"HYPE:{t['tokenId']}")
+    v, lat, ok = E.wait_until(lambda: c.evm.balance(acct.address), lambda b: b > e0)
+    j.log("fund_evm", amount=str(x), destination=dest, response=res, evm_before=e0, evm_after=v, latency_s=lat, arrived=ok)
+    print(f"FUND-EVM: {'OK' if ok else 'НЕ ДОШЛО'} — EVM {hype(e0)} -> {hype(v)} HYPE "
+          f"(план просит ~{hype(plan['gas']['need_wei_at_plan'])})")
+    return 0 if ok else 1
+
+
+def cmd_status(run: str, out_base: str = OUT_BASE) -> int:
+    d, plan = load_plan(out_base, run)
+    E = e103()
+    net = Net(plan["network"], E)
+    net.assert_chain()
+    st = Journal(os.path.join(d, "journal.jsonl"), E.Secrets(), E).state()
+    dep = plan["deployer"]
+    lat, pen = net.nonce(dep, "latest"), net.nonce(dep, "pending")
+    print(f"прогон {plan['run']} ({plan['network']['name']}), коммит {plan['commit'][:12]}")
+    print(f"деплойер {dep}: nonce latest {lat} / pending {pen} (план: старт {plan['start_nonce']}, "
+          f"следующая часть — nonce {plan['start_nonce'] + len(st['mined'])}), EVM {hype(net.balance(dep))} HYPE")
+    if not plan["network"]["test"]:
+        print(f"большие блоки: {'вкл' if net.rpc('eth_usingBigBlocks', dep) else 'выкл'}")
+    for t in plan["txs"]:
+        s = "на цепи" if t["i"] in st["mined"] else ("отправлена" if t["i"] in st["sent"] else "—")
+        print(f"  {t['i'] + 1:2}. {t['part']:20} {t['address']}  {s}")
+    return 0
+
+
+# --- selftest ------------------------------------------------------------------------------------------------------- #
+def _raises(fn, needle: str = "") -> bool:
+    try:
+        fn()
+    except (ValueError, DeployStop) as e:
+        return needle in str(e)
+    return False
+
+
+def safe_mock_code(owner_addr: str) -> str:
+    """Рантайм-код заглушки Safe для сети selftest'а: getThreshold() -> 1, getOwners() -> [owner], прочее — revert."""
+    o = owner_addr[2:].lower()
+    head = "60003560e01c"                                     # selector = calldata[0] >> 224
+    body = [head, "80", "63" + SAFE_SEL["getThreshold()"], "14", "60{T}", "57",
+            "63" + SAFE_SEL["getOwners()"], "14", "60{O}", "57", "60008080fd"]
+    thr = ["5b", "600160005260206000f3"]
+    own = ["5b", "6020600052", "6001602052", "73" + o + "604052", "60606000f3"]
+    pre = "".join(body).replace("{T}", "00").replace("{O}", "00")
+    t_off = len(pre) // 2
+    o_off = t_off + len("".join(thr)) // 2
+    code = "".join(body).replace("{T}", f"{t_off:02x}").replace("{O}", f"{o_off:02x}") + "".join(thr) + "".join(own)
+    return "0x" + code
+
+
+def static_checks(chk) -> None:
+    E = e103()
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    chk("ARGV-SECRET: флагов-секретов Foundry в исходнике нет (судья владельца e103)", E.argv_secret_flags(src) == [])
+    chk("ARGV-SECRET: саботаж — вставленный флаг ловится", E.argv_secret_flags(src + " --private" + "-key ") != [])
+    chk("KEY: pop в main() — первая строка, до разбора аргументов и детей",
+        re.search(r"def main\(\):\n(?:\s+\"\"\"[\s\S]*?\"\"\"\n)?\s+raw_key = os\.environ\.pop\(KEY_ENV, None\)", src) is not None)
+    s = E.Secrets()
+    chk("KEY: пусто -> отказ без значения", _raises(lambda: take_key("", s), KEY_ENV))
+    bad = "zz" * 32
+    chk("KEY: не-hex -> отказ, значение не печатается", _raises(lambda: take_key(bad, s), "не печатаю"))
+    from eth_account import Account
+    a = Account.create()
+    k = "0x" + bytes(a.key).hex()
+    s2 = E.Secrets()
+    chk("KEY: годный ключ -> адрес, значение в реестре секретов", take_key(k, s2).address == a.address and s2.found_in(k))
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="pdm_static_")
+    j = Journal(os.path.join(tmp, "j.jsonl"), s2, E)
+    chk("JOURNAL: значение ключа в строке -> отказ записи", _raises(lambda: j.log("x", note=k[2:].upper())))
+    chk("JOURNAL: поле *_key -> отказ", _raises(lambda: j.log("x", deployer_key="1")))
+    chk("JOURNAL: 64-hex в поле tx законен", j.log("x", tx="0x" + "ab" * 32)["tx"] == "0x" + "ab" * 32)
+    chk("JOURNAL: 64-hex вне поля-хеша -> отказ", _raises(lambda: j.log("x", note="0x" + "ab" * 32)))
+    chk("NET: mainnet = ровно константы", check_spec(dict(MAINNET)) == MAINNET)
+    chk("NET: mainnet с чужим RPC -> отказ", _raises(lambda: check_spec(dict(MAINNET, evm_rpc="https://evil.example/evm"))))
+    chk("NET: selftest не на 127.0.0.1 -> отказ",
+        _raises(lambda: check_spec({"test": True, "evm_rpc": "https://rpc.hyperliquid.xyz/evm", "chain_id": 5}), "127.0.0.1"))
+    chk("NET: selftest с chainId 999 -> отказ",
+        _raises(lambda: check_spec({"test": True, "evm_rpc": "http://127.0.0.1:8545", "chain_id": 999}), "999"))
+
+    class Fake(Net):
+        def __init__(self, spec, got):
+            super().__init__(spec, E); self.got = got
+
+        def rpc(self, method, *p):
+            return hex(self.got)
+    chk("NET: замер chainId 998 при mainnet -> отказ", _raises(lambda: Fake(dict(MAINNET), 998).assert_chain(), "не та"))
+    chk("NET: замер 999 при mainnet -> ок", Fake(dict(MAINNET), 999).assert_chain() == 999)
+    chk("NET: сеть selftest'а, а цепь ответила 999 -> отказ",
+        _raises(lambda: Fake({"test": True, "evm_rpc": "http://127.0.0.1:1", "chain_id": 31337, "name": "t"}, 999).assert_chain()))
+    abi = [{"type": "constructor", "inputs": [{"name": "p", "type": "tuple", "components": [
+        {"name": "ledger", "type": "address"}, {"name": "delay", "type": "uint256"}, {"name": "ok", "type": "bool"}]},
+        {"name": "t", "type": "uint256[2]"}]}]
+    words = bytes(12) + bytes.fromhex("ab" * 20) + (7).to_bytes(32, "big") + (1).to_bytes(32, "big") + \
+        (5).to_bytes(32, "big") + (6).to_bytes(32, "big")
+    dec = decode_args(abi, words)
+    chk("ABI: конструктор с кортежем и массивом декодируется по именам",
+        [(x["name"], x["value"]) for x in dec] == [("p.ledger", "0x" + "ab" * 20), ("p.delay", 7), ("p.ok", True),
+                                                    ("t[0]", 5), ("t[1]", 6)])
+    chk("ABI: длина не та -> отказ", _raises(lambda: decode_args(abi, words[:-32])))
+    chk("ADDR: EIP-55 опечатка регистра -> отказ",
+        _raises(lambda: norm_addr("roles.admin", "0x52908400098527886E0F7030069857D2E4169EE7".replace("E7", "e7")), "EIP-55"))
+    chk("ADDR: плейсхолдер -> отказ с именем поля", _raises(lambda: norm_addr("roles.admin", "<ADMIN_SAFE>"), "roles.admin"))
+    chk("TREE: блоб git считается как git hash-object", blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a")
+
+
+def make_params(D, tree: str, path: str, roles: dict, treasury: str, extra: dict = None) -> dict:
+    """Параметры selftest'а: файл беты коммита; адреса — selftest'а; TBD — числа владельца (`rehearsal_constants`:
+    первая фикстура эталона)."""
+    beta = os.path.join(tree, "contracts", "deploy", "params.beta.json")
+    doc = json.load(open(beta, encoding="utf-8"))
+    rc = D.rehearsal_constants(D.load_params(beta))
+    doc["roles"].update(roles)
+    doc["ledger"]["treasury"] = treasury
+    for k, v in doc["ledger"].items():
+        if v == "TBD":
+            doc["ledger"][k] = int(rc[k])
+    for k, v in (extra or {}).items():
+        doc[k] = v
+    json.dump(doc, open(path, "w", encoding="utf-8"), indent=1)
+    return doc
+
+
+def mutate(v):
+    if isinstance(v, bool):
+        return not v
+    if isinstance(v, int):
+        return v + 1
+    if v is None:
+        return 1
+    s = str(v)
+    if re.fullmatch(r"0x[0-9a-f]+", s):
+        return s[:-1] + ("0" if s[-1] != "0" else "1")
+    return s + "x"
+
+
+def set_leaf(o, path: str, v):
+    parts = re.findall(r"[^.\[\]]+|\[\d+\]", path)
+    for p in parts[:-1]:
+        o = o[int(p[1:-1])] if p.startswith("[") else o[p]
+    last = parts[-1]
+    if last.startswith("["):
+        o[int(last[1:-1])] = v
+    else:
+        o[last] = v
+
+
+def r3p_stand(D, art, commit, chk, plan) -> None:
+    """Ревью-3 R3-P: опасные параметры, которые `postdeploy` владельца пропускает (он сверяет цепь только с манифестом, а
+    манифест — сам с собой). Деплой порядком владельца на своём anvil, затем `chain_vs_params` против файла параметров:
+    FAIL с именем каждого поля. Репро ревьюера (`hlu-review3-tools/pd_repro.py`) воспроизводится дословно."""
+    layout = D.storage_layout()
+    D.storage_layout = lambda: layout                           # стенд: раскладка не зависит от параметров
+    cp = lambda x: json.loads(json.dumps(x))
+
+    def run(roles, const, p_roles, p_const):
+        ch = D.Chain()
+        try:
+            m = D.deploy_pool(ch, art, const, roles)
+            D.rehearsal_core(ch)
+            owner_bad = D.postdeploy_check(ch, m, art)
+            mine = chain_vs_params(ch, D, art, {k: v["address"] for k, v in m["parts"].items()}, p_roles, p_const)
+        finally:
+            ch.close()
+        return owner_bad, mine
+    R, C = cp(plan["roles"]), cp(plan["constants"])
+    mi = min(43, D.max_investors_bound())
+    r, c = cp(R), cp(C)
+    r["terms"] = dict(r["terms"], t_nomonday=4 * DAY_S, t_queue_max=18 * DAY_S)
+    r["queue_floor"] = dict(r["queue_floor"], settle_d=1, keeper_margin_s=0)
+    r["tvl_cap"] = 10 ** 18
+    c.update(max_investors=mi, hold_bps=0, fee_bps=D.BPS)
+    owner_bad, mine = run(r, c, R, C)
+    want = ["T_NOMONDAY", "T_QUEUE_MAX", "tvlCap", "maxInvestors", "holdBps", "feeBps"]
+    chk(f"[{commit[:8]}] R3-P репро ревьюера: postdeploy владельца PASS на опасных параметрах (воспроизведено)", not owner_bad,
+        owner_bad)
+    chk(f"[{commit[:8]}] R3-P репро ревьюера: verify FAIL с именами {want}", all(any(w in x for x in mine) for w in want), mine)
+    for name, edit, needle in (
+            ("T_NOMONDAY = 2·DELAY и в файле, и на цепи", lambda r, c: r["terms"].__setitem__("t_nomonday", 2 * r["delay"]),
+             "T_NOMONDAY"),
+            ("граница очереди из подменённых слагаемых и в файле, и на цепи",
+             lambda r, c: (r["queue_floor"].update(settle_d=1, keeper_margin_s=0),
+                           r["terms"].__setitem__("t_queue_max", 18 * DAY_S)), "T_QUEUE_MAX"),
+            ("holdBps = 0 и в файле, и на цепи", lambda r, c: c.__setitem__("hold_bps", 0), "holdBps")):
+        r, c = cp(R), cp(C)
+        edit(r, c)
+        owner_bad, mine = run(r, c, r, c)
+        chk(f"[{commit[:8]}] R3-P независимая граница: {name} -> postdeploy владельца {'PASS' if not owner_bad else 'FAIL'}, "
+            f"verify FAIL с именем {needle}", any(needle in x for x in mine), mine)
+    for field, key, val, needle in (("vault.tvl_cap", "tvl_cap", 10 ** 18, "tvlCap"),
+                                    ("ledger.max_investors", "max_investors", mi - 1, "maxInvestors"),
+                                    ("ledger.fee_bps", "fee_bps", D.BPS, "feeBps")):
+        r, c = cp(R), cp(C)
+        (r if key == "tvl_cap" else c)[key] = val
+        owner_bad, mine = run(r, c, R, C)
+        chk(f"[{commit[:8]}] R3-P цепь против файла: {field} подменён при деплое -> verify FAIL с именем {needle}",
+            any(needle in x and "файле параметров" in x for x in mine), mine)
+
+
+def e2e(commit: str, chk, tmp: str) -> None:
+    """Полный прогон plan/deploy/verify/manifest/sourcify на СВОЁМ anvil (сеть selftest'а: свой chainId, 127.0.0.1)."""
+    E = e103()
+    from eth_account import Account
+    commit = resolve_commit(commit)
+    tree = tree_of(commit, SELFTEST_EXTRA)
+    D = owner(tree)
+    art = D.build()
+    out = os.path.join(tmp, "runs_" + commit[:8])
+    me = os.path.abspath(__file__)
+    net_chain = D.Chain()
+    try:
+        url = net_chain.url
+        rpc = net_chain.rpc
+        dep = Account.create()
+        rpc("anvil_setBalance", dep.address, hex(10 ** 24))
+        rpc("anvil_setNonce", dep.address, hex(7))
+        safe_owner = Account.create().address
+        admin = "0x" + "5a" * 20
+        rpc("anvil_setCode", admin, safe_mock_code(safe_owner))
+        keeper, guardian, treasury = (Account.create().address for _ in range(3))
+        pfile = os.path.join(tmp, f"params_{commit[:8]}.json")
+        roles_in = {"admin": admin, "keeper": keeper, "guardian": guardian}
+        doc = make_params(D, tree, pfile, roles_in, treasury)
+        P = D.load_params(pfile)
+        chk(f"[{commit[:8]}] PARAMS: годные проходят", check_params(D, P, doc, dep.address)[0]["admin"] == admin)
+
+        def bad_params(edit, needle):
+            d2 = json.loads(json.dumps(doc)); edit(d2)
+            p2 = pfile + ".bad.json"; json.dump(d2, open(p2, "w", encoding="utf-8"))
+            return _raises(lambda: check_params(D, D.load_params(p2), d2, dep.address), needle)
+        chk(f"[{commit[:8]}] PARAMS: TBD -> отказ с именем поля",
+            bad_params(lambda x: x["ledger"].__setitem__("fee_bps", "TBD"), "ledger.fee_bps"))
+        chk(f"[{commit[:8]}] PARAMS: delay < MIN_DELAY -> отказ",
+            bad_params(lambda x: x["vault"].__setitem__("delay", D.min_delay() - 1), "vault.delay"))
+        chk(f"[{commit[:8]}] PARAMS: срок < 2·DELAY -> отказ с именем срока",
+            bad_params(lambda x: x["terms"].__setitem__("t_dead", 2 * x["vault"]["delay"] - 1), "terms.t_dead"))
+        chk(f"[{commit[:8]}] PARAMS: T_QUEUE_MAX ниже границы владельца -> отказ",
+            bad_params(lambda x: x["queue_floor"].__setitem__("settle_d", x["terms"]["t_queue_max"] // 86400 + 1),
+                       "terms.t_queue_max"))
+        chk(f"[{commit[:8]}] PARAMS: max_investors выше границы кода -> отказ",
+            bad_params(lambda x: x["ledger"].__setitem__("max_investors", D.max_investors_bound() + 1), "ledger.max_investors"))
+        chk(f"[{commit[:8]}] PARAMS: keeper = guardian -> отказ",
+            bad_params(lambda x: x["roles"].__setitem__("keeper", guardian), "keeper"))
+        chk(f"[{commit[:8]}] PARAMS: деплойер = keeper -> отказ",
+            bad_params(lambda x: x["roles"].__setitem__("keeper", dep.address), "deployer"))
+        chk(f"[{commit[:8]}] PARAMS: treasury = guardian без флага -> отказ",
+            bad_params(lambda x: x["ledger"].__setitem__("treasury", guardian), "treasury_is_guardian"))
+        d3 = json.loads(json.dumps(doc)); d3["ledger"]["treasury"] = guardian; d3["deploy_choices"] = {"treasury_is_guardian": True}
+        p3 = pfile + ".tig.json"; json.dump(d3, open(p3, "w", encoding="utf-8"))
+        chk(f"[{commit[:8]}] PARAMS: treasury = guardian с явным флагом -> принято",
+            check_params(D, D.load_params(p3), d3, dep.address)[2]["treasury_is_guardian"] is True)
+        chk(f"[{commit[:8]}] PARAMS: флаг treasury_is_guardian при разных адресах -> отказ",
+            bad_params(lambda x: x.__setitem__("deploy_choices", {"treasury_is_guardian": True}), "treasury_is_guardian"))
+        chk(f"[{commit[:8]}] PARAMS: плейсхолдер роли -> отказ",
+            bad_params(lambda x: x["roles"].__setitem__("admin", "<ADMIN_SAFE>"), "roles.admin"))
+        chk(f"[{commit[:8]}] R3-P PARAMS: T_NOMONDAY не длиннее расчёта + 2·DELAY -> отказ плана",
+            bad_params(lambda x: x["terms"].__setitem__("t_nomonday", 2 * x["vault"]["delay"]), "T_NOMONDAY"))
+        chk(f"[{commit[:8]}] R3-P PARAMS: граница очереди из подменённых слагаемых файла -> отказ по числу владельца",
+            bad_params(lambda x: (x["queue_floor"].update(settle_d=1, keeper_margin_s=0),
+                                  x["terms"].__setitem__("t_queue_max", 18 * DAY_S)), "T_QUEUE_MAX"))
+        chk(f"[{commit[:8]}] R3-P PARAMS: hold_bps не равен катастрофическому стопу -> отказ",
+            bad_params(lambda x: x["ledger"].__setitem__("hold_bps", 0), "holdBps"))
+        # роли на цепи; прекомпайл Core: все на Core (R3-D: деплойер обязан иметь счёт)
+        D.rehearsal_core(net_chain)
+        rpc("anvil_setCode", guardian, "0x00")
+        chk(f"[{commit[:8]}] ROLES: guardian с кодом -> отказ плана",
+            _raises(lambda: cmd_plan(commit, pfile, dep.address, run="bad_guardian", selftest_anvil=url, out_base=out), "EOA"))
+        rpc("anvil_setCode", guardian, "0x")
+        rpc("anvil_setCode", admin, "0x")
+        chk(f"[{commit[:8]}] ROLES: admin без кода -> отказ плана",
+            _raises(lambda: cmd_plan(commit, pfile, dep.address, run="bad_admin", selftest_anvil=url, out_base=out), "Safe"))
+        rpc("anvil_setCode", admin, safe_mock_code(safe_owner))
+        D.rehearsal_core(net_chain, inactive=dep.address)
+        chk(f"[{commit[:8]}] R3-D: деплойер без счёта на Core -> отказ плана",
+            _raises(lambda: cmd_plan(commit, pfile, dep.address, run="bad_core", selftest_anvil=url, out_base=out),
+                    "coreUserExists"))
+        D.rehearsal_core(net_chain)
+        chk(f"[{commit[:8]}] NET: --selftest-anvil не на 127.0.0.1 -> отказ",
+            _raises(lambda: cmd_plan(commit, pfile, dep.address, run="bad_net", out_base=out,
+                                     selftest_anvil=url.replace("127.0.0.1", "localhost")), "127.0.0.1"))
+        # plan
+        run = cmd_plan(commit, pfile, dep.address, run="e2e", selftest_anvil=url, out_base=out)
+        d, plan = load_plan(out, run)
+        chk(f"[{commit[:8]}] PLAN: адрес каждой части = CREATE(деплойер, 7+i) владельца",
+            all(t["address"] == D.create_address(dep.address, 7 + t["i"]) for t in plan["txs"]))
+        chk(f"[{commit[:8]}] PLAN: хранилище последним, на nonce манифеста владельца",
+            plan["txs"][-1]["part"] == "PoolVault" and plan["dry_manifest"]["vault_nonce"] == plan["txs"][-1]["nonce"])
+        share = plan["roles"]["leg_share_bps"]
+        want_act = sorted(["PoolVault"] + (["TradingLegA"] if share > 0 else []) + (["TradingLegB"] if share < D.BPS else []))
+        chk(f"[{commit[:8]}] PLAN: активировать (доля ноги A {share}) — {want_act}",
+            sorted(a["part"] for a in plan["activation"]) == want_act, plan["activation"])
+        chk(f"[{commit[:8]}] PLAN: ни одной транзакции в сеть (nonce деплойера 7)", int(rpc("eth_getTransactionCount", dep.address, "latest"), 16) == 7)
+        chk(f"[{commit[:8]}] R3-D PLAN: лимит газа = оценка × (1 + r), r = {plan['gas_margin']['r']:.5f} из замера "
+            f"(сухой {plan['gas_margin']['r_dry']}, оценщик HyperEVM {plan['gas_margin']['r_hyperevm_estimator']:.5f}); частей "
+            f"выше малого блока {sum(t['gas_limit'] > SMALL_BLOCK_GAS_LIMIT for t in plan['txs'])}",
+            plan["gas_margin"]["r"] > 0 and all(t["gas_limit"] > t["gas_estimate"] >= t["gas_used"] for t in plan["txs"]))
+        n = len(plan["txs"])
+        env = {kk: v for kk, v in E.child_env().items()}
+        key_hex = "0x" + bytes(dep.key).hex()
+
+        def deploy(word, crash=None, key=key_hex, rn=run, cut=None):
+            e = dict(env, PYTHONIOENCODING="utf-8", **{KEY_ENV: key})
+            if crash is not None:
+                e[CRASH_ENV] = str(crash)
+            if cut is not None:
+                e[GAS_CUT_ENV] = str(cut)
+            return subprocess.run([sys.executable, me, "deploy", "--run", rn, "--out-base", out], input=word, text=True,
+                                  capture_output=True, encoding="utf-8", errors="replace", env=e, timeout=1800)
+        nonce = lambda a=dep.address: int(rpc("eth_getTransactionCount", a, "latest"), 16)
+        r = deploy("НЕТ\n")
+        chk(f"[{commit[:8]}] DEPLOY: не то слово -> rc 2, ничего не отправлено", r.returncode == 2 and nonce() == 7)
+        other = Account.create()
+        other_hex = "0x" + bytes(other.key).hex()
+        r = deploy("DEPLOY\n", key=other_hex)
+        chk(f"[{commit[:8]}] DEPLOY: чужой ключ -> отказ до отправки", r.returncode != 0 and "не тот ключ" in r.stderr and nonce() == 7)
+        chk(f"[{commit[:8]}] DEPLOY: значение поданного ключа нигде в выводе", other_hex[2:] not in (r.stdout + r.stderr).lower())
+        r = deploy("DEPLOY\n", crash=3)
+        chk(f"[{commit[:8]}] DEPLOY: обрыв после 3-й части -> на цепи ровно 3", r.returncode != 0 and nonce() == 10,
+            r.stdout[-400:] + r.stderr[-800:])
+        r = deploy("DEPLOY\n")
+        chk(f"[{commit[:8]}] DEPLOY: повтор продолжает с 4-й -> все {n} частей, nonce {7 + n}",
+            r.returncode == 0 and nonce() == 7 + n and "DEPLOY: OK" in r.stdout, r.stdout[-600:] + r.stderr[-1200:])
+        rows = Journal(os.path.join(d, "journal.jsonl"), E.Secrets(), E).rows()
+        chk(f"[{commit[:8]}] JOURNAL: каждая часть отправлена ровно раз",
+            sorted(x["i"] for x in rows if x["event"] == "sent") == list(range(n)))
+        chk(f"[{commit[:8]}] JOURNAL: значения ключа в файлах прогона нет",
+            not any(key_hex[2:] in open(os.path.join(dp, f), encoding="utf-8", errors="ignore").read().lower()
+                    for dp, _, fs in os.walk(d) for f in fs))
+        r = deploy("")
+        chk(f"[{commit[:8]}] DEPLOY: третий запуск — отправлять нечего, без вопроса, rc 0",
+            r.returncode == 0 and nonce() == 7 + n and "Введите" not in r.stdout, r.stdout[-400:] + r.stderr[-600:])
+        mp = os.path.join(d, "manifest.json")
+        mf = json.load(open(mp, encoding="utf-8"))
+        chk(f"[{commit[:8]}] MANIFEST: восстановленный из журнала и цепи равен записанному",
+            cmd_manifest(run, out) == 0)
+        chk(f"[{commit[:8]}] MANIFEST: схема владельца, части = плану, sha256 параметров = файлу прогона",
+            mf["schema"] == D.MANIFEST_SCHEMA and mf["parts"] == plan["dry_manifest"]["parts"]
+            and mf["deploy"]["params_sha256"] == sha256_file(os.path.join(d, "params.json")))
+        vault = mf["parts"]["PoolVault"]["address"]
+        chk(f"[{commit[:8]}] VERIFY: все части на Core -> PASS", cmd_verify(run, out) == 0)
+        chk(f"[{commit[:8]}] VERIFY --params: тот же файл -> PASS", cmd_verify(run, out, pfile) == 0)
+        chk(f"[{commit[:8]}] VERIFY --params: другой файл параметров -> FAIL", cmd_verify(run, out, p3) == 1)
+        rpc("anvil_setCode", D.CORE_USER_EXISTS, "0x")
+        chk(f"[{commit[:8]}] VERIFY: без прекомпайла Core -> FAIL", cmd_verify(run, out) == 1)
+        D.rehearsal_core(net_chain, inactive=vault)
+        chk(f"[{commit[:8]}] VERIFY: хранилище не активировано -> FAIL", cmd_verify(run, out) == 1)
+        D.rehearsal_core(net_chain)
+        # R3-P: изменяемое состояние хранилища после деплоя -> verify FAIL с именем (каждое — на снимке цепи)
+        va = art["vault"]
+        lay = {lb: int(sl) for lb, sl, _, _ in D.layout_of("PoolVault")[0]}
+        from eth_utils import keccak as kk_
+
+        def state_case(name, act, needle):
+            snap = rpc("evm_snapshot")
+            try:
+                act()
+                ok = cmd_verify(run, out) == 1 and any(needle in x for x in chain_vs_params(
+                    net_chain, D, art, {k: v["address"] for k, v in mf["parts"].items()}, plan["roles"], plan["constants"]))
+            finally:
+                rpc("evm_revert", snap)
+            chk(f"[{commit[:8]}] R3-P VERIFY: {name} -> FAIL с именем {needle}", ok)
+
+        def pause():
+            rpc("anvil_impersonateAccount", guardian)
+            rpc("anvil_setBalance", guardian, hex(10 ** 20))
+            net_chain.receipt(rpc("eth_sendTransaction", {"from": guardian, "to": vault,
+                                                          "data": "0x" + va["methodIdentifiers"]["pauseDeposits()"]}))
+        state_case("депозиты на паузе", pause, "depositsPaused")
+        state_case("legFlow != 0", lambda: rpc("anvil_setStorageAt", vault, hex(lay["legFlow"]), "0x" + "00" * 31 + "05"),
+                   "legFlow")
+        state_case("открытое окно ноги", lambda: rpc("anvil_setStorageAt", vault, hex(lay["windows"]), "0x" + "00" * 31 + "01"),
+                   "windows(0)")
+        pslot = "0x" + kk_((0).to_bytes(32, "big") + lay["proposals"].to_bytes(32, "big")).hex()
+        state_case("висящее предложение таймлока", lambda: rpc("anvil_setStorageAt", vault, pslot, "0x" + "00" * 31 + "07"),
+                   "proposals(0)")
+        chk(f"[{commit[:8]}] VERIFY: после снимков цепь снова чистая -> PASS", cmd_verify(run, out) == 0)
+        # R3-P: опасные параметры, которые postdeploy владельца пропускает (репро ревьюера) -> FAIL с именами
+        r3p_stand(D, art, commit, chk, plan)
+        # подмена каждого поля манифеста -> verify краснеет (судьи: манифест = восстановленному; postdeploy владельца)
+        regen = json.load(open(mp, encoding="utf-8"))
+        layout = D.storage_layout()
+        D.storage_layout = lambda: layout                       # ускорение стенда: раскладка не зависит от манифеста
+        ro = D.RemoteChain(url, 0)
+        miss, owner_red, owner_blind = [], 0, []
+        for path, v in leaves(regen):
+            m2 = json.loads(json.dumps(regen)); set_leaf(m2, path, mutate(v))
+            red_regen = bool(leaf_diff(m2, regen))
+            try:
+                red_owner = bool(D.postdeploy_check(ro, m2, art))
+            except Exception:
+                red_owner = True                                # владелец падает на негодном поле — rc != 0 у postdeploy
+            owner_red += red_owner
+            if not red_owner and not path.startswith("deploy."):
+                owner_blind.append(path)
+            if not (red_regen or red_owner):
+                miss.append(path)
+        nleaf = len(list(leaves(regen)))
+        chk(f"[{commit[:8]}] VERIFY: подмена каждого из {nleaf} полей манифеста краснеет (владелец сам — {owner_red})", not miss, miss)
+        print(f"      поля формата владельца, которые его postdeploy сам НЕ судит (ловит сверка с восстановленным): {owner_blind}")
+        for path in ("parts.PoolVault.codehash", "roles.tvl_cap", "constants.fee_bps", "deploy.params_sha256"):
+            bad_mf = json.loads(json.dumps(regen)); set_leaf(bad_mf, path, mutate(dict(leaves(regen))[path]))
+            write_json(mp, bad_mf)
+            chk(f"[{commit[:8]}] VERIFY: файл манифеста с подменой {path} -> FAIL", cmd_verify(run, out) == 1)
+        write_json(mp, regen)
+        chk(f"[{commit[:8]}] VERIFY: восстановленный файл -> PASS", cmd_verify(run, out) == 0)
+        # sourcify (R3-S): стандартный JSON forge, keccak = метаданным, solc = сборке
+        chk(f"[{commit[:8]}] R3-S SOURCIFY: стандартный JSON проверен (keccak, solc = сборке)", cmd_sourcify(run, out) == 0)
+        req = json.load(open(os.path.join(d, "sourcify", "PoolVault", "request.json"), encoding="utf-8"))
+        chk(f"[{commit[:8]}] R3-S SOURCIFY: тело v2 — stdJsonInput, compilerVersion, contractIdentifier, tx создания",
+            req["contractIdentifier"] == "src/PoolVault.sol:PoolVault" and "src/PoolVault.sol" in req["stdJsonInput"]["sources"]
+            and req["creationTransactionHash"] == mf["deploy"]["txs"]["PoolVault"]["tx"] and "+commit." in req["compilerVersion"])
+        # сдвиг nonce между планом и деплоем: деплой отказывает ДО отправки
+        dep2 = Account.create()
+        rpc("anvil_setBalance", dep2.address, hex(10 ** 24))
+        run2 = cmd_plan(commit, pfile, dep2.address, run="shift", selftest_anvil=url, out_base=out)
+        rpc("anvil_impersonateAccount", dep2.address)
+        net_chain.receipt(rpc("eth_sendTransaction", {"from": dep2.address, "to": dep2.address, "value": "0x0"}))
+        rpc("anvil_stopImpersonatingAccount", dep2.address)
+        r = deploy("DEPLOY\n", key="0x" + bytes(dep2.key).hex(), rn=run2)
+        chk(f"[{commit[:8]}] DEPLOY: nonce сдвинут мимо скрипта -> стоп до отправки",
+            r.returncode != 0 and "nonce" in r.stderr and nonce(dep2.address) == 1, r.stderr[-600:])
+        # параметры правили после плана -> отказ
+        p2 = os.path.join(out, run2, "params.json")
+        open(p2, "a", encoding="utf-8").write(" ")
+        r = deploy("DEPLOY\n", key="0x" + bytes(dep2.key).hex(), rn=run2)
+        chk(f"[{commit[:8]}] DEPLOY: params.json изменён после плана -> отказ", r.returncode != 0 and "sha256" in r.stderr)
+        # R3-D: часть упала по газу ВНУТРИ блока (nonce потрачен) -> стоп до следующей части, и при повторе тоже
+        dep3 = Account.create()
+        rpc("anvil_setBalance", dep3.address, hex(10 ** 24))
+        run3 = cmd_plan(commit, pfile, dep3.address, run="oog", selftest_anvil=url, out_base=out)
+        k3 = "0x" + bytes(dep3.key).hex()
+        r = deploy("DEPLOY\n", key=k3, rn=run3, cut=2)
+        chk(f"[{commit[:8]}] R3-D DEPLOY: часть №2 — кончился газ -> стоп, часть №3 не отправлена (nonce 2)",
+            r.returncode != 0 and "КОНЧИЛСЯ ГАЗ" in r.stderr and "ПОТРАЧЕН" in r.stderr and nonce(dep3.address) == 2,
+            r.stdout[-300:] + r.stderr[-600:])
+        r = deploy("DEPLOY\n", key=k3, rn=run3)
+        chk(f"[{commit[:8]}] R3-D DEPLOY: повтор после отката -> стоп без отправки (nonce 2)",
+            r.returncode != 0 and "ОТКАТИЛАСЬ" in r.stderr and nonce(dep3.address) == 2, r.stderr[-600:])
+    finally:
+        net_chain.close()
+
+
+def selftest(commits: list, static_only: bool) -> int:
+    res = []
+
+    def chk(name, ok, detail=None):
+        res.append(bool(ok))
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok or detail is None else f"\n        {str(detail)[:1500]}"))
+    static_checks(chk)
+    if not static_only:
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="pdm_e2e_")
+        for c in commits:
+            e2e(c, chk, tmp)
+    print(f"SELFTEST: {sum(res)}/{len(res)} {'PASS' if all(res) else 'FAIL'}")
+    return 0 if all(res) else 1
+
+
+# --- CLI ---------------------------------------------------------------------------------------------------------- #
+def main():
+    raw_key = os.environ.pop(KEY_ENV, None)
+    ap = argparse.ArgumentParser(description="деплой пула Rubik на HyperEVM mainnet (запускает оператор)")
+    ap.add_argument("--out-base", default=OUT_BASE, help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan")
+    p.add_argument("--commit", required=True); p.add_argument("--params", required=True)
+    p.add_argument("--deployer", required=True); p.add_argument("--run")
+    p.add_argument("--selftest-anvil", help="ТОЛЬКО selftest: http://127.0.0.1:<порт> своего anvil (chainId != 999)")
+    for name in ("deploy", "manifest", "verify", "sourcify", "status"):
+        sub.add_parser(name).add_argument("--run", required=True)
+    sub.choices["verify"].add_argument("--params", help="ваш файл параметров: sha256 обязан совпасть с деплоем")
+    f = sub.add_parser("fund-evm")
+    f.add_argument("--run", required=True); f.add_argument("--hype", required=True)
+    mg = sub.add_parser("measure-gas", help="только чтение testnet: газ частей HyperEVM против anvil (свидетельство запаса)")
+    mg.add_argument("--commit", help="дерево, чей anvil-раннер владельца берётся (по умолчанию HEAD)")
+    mg.add_argument("--testnet-manifest", required=True)
+    s = sub.add_parser("selftest")
+    s.add_argument("--commit", action="append"); s.add_argument("--static-only", action="store_true")
+    for sp in sub.choices.values():
+        sp.add_argument("--out-base", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    ob = a.out_base
+    if a.cmd not in ("deploy", "fund-evm"):
+        raw_key = None                                           # ключ не нужен этой команде — забыт сразу
+    try:
+        if a.cmd == "plan":
+            cmd_plan(a.commit, a.params, a.deployer, a.run, a.selftest_anvil, ob)
+            return 0
+        if a.cmd == "deploy":
+            return cmd_deploy(a.run, raw_key, ob)
+        if a.cmd == "fund-evm":
+            return cmd_fund_evm(a.run, a.hype, raw_key, ob)
+        if a.cmd == "measure-gas":
+            return cmd_measure_gas(a.commit or git("rev-parse", "HEAD"), a.testnet_manifest)
+        if a.cmd == "selftest":
+            return selftest(a.commit or [git("rev-parse", "HEAD")], a.static_only)
+        if a.cmd == "verify":
+            return cmd_verify(a.run, ob, a.params)
+        return {"manifest": cmd_manifest, "sourcify": cmd_sourcify, "status": cmd_status}[a.cmd](a.run, ob)
+    except (DeployStop, ValueError) as e:
+        print(f"\nСТОП ({a.cmd}): {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

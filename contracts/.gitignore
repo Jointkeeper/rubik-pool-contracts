@@ -1,0 +1,19 @@
+# Compiler files
+cache/
+out/
+
+# Commonly ignored directories
+.logs/
+.ignore/
+
+# Broadcast logs несут адреса/tx testnet-прогонов — не коммитим (root .gitignore это уже
+# требует; здесь дублируем без forge-boilerplate'ного !/broadcast, который его побеждал)
+/broadcast/
+
+# Docs
+docs/
+
+# Dotenv file
+.env
+.env.*
+!.env.example

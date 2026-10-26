@@ -1,0 +1,1033 @@
+# -*- coding: utf-8 -*-
+"""vault_rev9_stand — anvil-стенд keeper'а (и сторожа) против НАСТОЯЩЕГО `PoolVault` двух редакций ветки
+`work/pool-contract-rev9`: ea165ccd (задеплоен на testnet-стенде) и de2666d7 (события для сторожа, «вывести всё», запас
+газа заявок, доля ног под таймлоком). Редакция — аргумент запуска; keeper и сторож выбирают поведение по КОДУ контракта.
+
+Контракт живёт в другой ветке (`work/pool-contract-rev9`, коммит ea165ccd — он же задеплоен на HyperEVM testnet-стенде).
+`contracts/src` этой ветки — прежняя редакция (ни возврата, ни окон), и правится она в другой ветке, поэтому стенд берёт
+исходники ea165ccd ИЗ ИСТОРИИ (`git archive`) во временный каталог, кладёт туда моки прекомпайлов этой ветки
+(`contracts/test/mocks/CoreMocks.sol`) и собирает их своим `forge` (деплой КЕ10 — дифференциала ea165ccd:
+`deploy_pool`). Свой anvil со случайным chainId на каждый раздел; чужих процессов не трогает.
+
+Keeper поднят из КОНФИГА боевым путём (`vault_keeper.build_from_config`, ключ из env, журнал nonce `init_journal`).
+Раздел ВОЗВРАТ (буфер 100 % — раздачи нет):
+  RF-A1 Send ниже минимума с хвостом мельче микро -> `refundDeposit(отправитель, ровно пришедшие wei, ledgerRef, 1)`,
+        событие `DepositRefunded` на цепи, деньги вернулись отправителю (Core), решение подтверждено исходящей записью
+        Core хранилища, сверка G1 судима и в допуске; сторож vault_watch на этой цепи зелен (W3b по настоящему событию);
+  RF-A2 возврат, ушедший в ручную очередь, пока keeper не видел `refundDeposit`, подхвачен рестартом без правки журнала;
+  RF-A3 падение между подписью `refundDeposit` и квитанцией — рестарт, тот же raw, транзакция одна;
+  RF-A4 падение после майнинга + ПОТЕРЯ журнала nonce — исход узнан по `DepositRefunded(ref)`, второй транзакции нет;
+  RF-A5 отказ контракта (`NotActivated` адресата) — стоп денежных операций, транзакции нет.
+Раздел ОКНА НОГ (буфер 10 % — раздача ногам):
+  WIN-A1 раздача -> приход на ноги -> `confirmSweep` -> `legToPerp`; зачисление после раздачи не висит на `LegBusy`;
+  WIN-A2 вывод: `legSendToVault` -> запись Core «с ноги» -> `confirmLegSend` -> выплата подтверждена; сверка в допуске;
+  WIN-A3 падение посреди окна (раздача замайнена, окна открыты) -> рестарт, одно подтверждение;
+  WIN-A4 подтверждение замайнено + ПОТЕРЯ журнала nonce -> исход по `LegTransferConfirmed` на цепи;
+  WIN-A5 отказ: раздача молча не дошла — подтверждения нет, окна открыты, стоп денежных операций (решение человека).
+Редакция de2666d7 — те же разделы (доля ног 60/40 из конструктора, событие возврата с полем token, трёхаргументный
+`requestWithdraw`, `processWithdrawals` с запасом газа CALL_GAS) и раздел СОБЫТИЯ И ЗАЯВКИ:
+  EV-A1 честный поток (депозит -> раздача -> вход/марк/закрытие -> понедельник по расписанию -> вывод): сторож по
+        СОБЫТИЯМ (свёртка ордеров, Σ realized, MondaySettled, ShortfallCovered) зелен, редакция узнана по коду;
+  EV-A2 «вывести всё» при лимите блока 30M (оценка + 2×CALL_GAS не помещается) — keeper ждёт с инцидентом, транзакции
+        нет; лимит поднят — исполнено одной транзакцией, выведена свободная доля;
+  EV-A3 саботаж keeper'а «газ без запаса» — НАСТОЯЩИЙ контракт майнит пустую транзакцию (оценка находит путь «ничего
+        не сделал»), keeper встаёт по «nextIntent не сдвинулся»;
+  EV-S* саботажи ключом keeper'а/admin'а, каждый со снимка: sizeOrder не того нотионала (W9), расчёт недели раньше T_пн
+        (W8:early), предложение и смена доли ног (WR, тревога без стопа).
+
+Финальная редакция ba1d6abb (`work/pool-contract-final`, модуль аварии) — разделы возврата и окон и раздел ФИНАЛ:
+  FN-A0..A2 редакция по коду, честный поток со сторожем, «вывести всё» обычным газом (нехватка — откат IntentStarved);
+  FN-A3     объявление аварии admin'ом (вид 7) — keeper встал, сторож — стоп;
+  FN-A4/A5  заморозка любым (триггер 6) — keeper не шлёт ничего, артефакт капитала закрыт, страж клиента не подписывает;
+  FN-A6     снимок, сбор с ноги, забирание доли любым — сторож сводит их записи Core.
+
+Запуск:  python contracts/diff/vault_rev9_stand.pytxt run [ea165ccd|de2666d7|ba1d6abb]   (по умолчанию ea165ccd;
+         Foundry — HL_FOUNDRY_BIN или PATH)
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timezone
+from decimal import Decimal
+from importlib.machinery import SourceFileLoader
+
+sys.stdout.reconfigure(encoding="utf-8")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+KS = sys.modules.get("vault_keeper_stand") or SourceFileLoader("vault_keeper_stand", os.path.join(
+    HERE, "vault_keeper_stand.pytxt")).load_module()
+WS = sys.modules.get("vault_watch_stand") or SourceFileLoader("vault_watch_stand", os.path.join(
+    HERE, "vault_watch_stand.pytxt")).load_module()
+ABI, RPC, VK, OB, VW, VC = KS.ABI, KS.RPC, KS.VK, KS.OB, WS.VW, WS.VC
+MICRO = VK.MICRO
+CONTRACT_COMMIT = "ea165ccd57a107028d34b0d1fcc09a79e4578cfb"     # контракт testnet-стенда (манифест e105)
+# Редакции контракта: коммит, доля ноги A конструктора (None — параметра нет, пополам), форма заявки и события возврата.
+EDITIONS = {
+    "ea165ccd": {"commit": CONTRACT_COMMIT, "share": None,
+                 "request": lambda amt: ("requestWithdraw(uint256,bool)", [amt, False]),
+                 "refunded": ("DepositRefunded(address,uint256,bytes32,uint8)", [True, False, True, False],
+                              lambda to, wei, ref, why: [to, wei, ref, why])},
+    "de2666d7": {"commit": "de2666d7a3f50bc55dfc9a741e09fbce9d11bf5d", "share": 6000,
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why])},
+    # финальная (`work/pool-contract-final`): + модуль аварии `PoolVaultEmergency`; сроки триггеров по времени — заведомо
+    # дальше стенда (заморозку стенд вызывает объявлением admin'а, триггер 6), не меньше `DELAY` (0)
+    "ba1d6abb": {"commit": "ba1d6abb5de6d8a2da95c19397dae54100d90bbf", "share": 6000,
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why]),
+                 "terms": {"t_stuck": 10 ** 9, "t_dead": 10 ** 9, "t_nomonday": 10 ** 9, "t_serve": 10 ** 9}},
+    # исправления враждебного ревью 20.10 — два пакета от ba1d6abb, пока не слиты: A (`work/pool-contract-final` fixA —
+    # заявки без try, PositionReduced, граница 43) и B (fixB — poolSink, В7′ по сроку T_QUEUE_MAX, часы с депозита)
+    "c3deb740": {"commit": "c3deb740", "share": 6000, "review": True,
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why]),
+                 "terms": {"t_stuck": 10 ** 9, "t_dead": 10 ** 9, "t_nomonday": 10 ** 9, "t_serve": 10 ** 9}},
+    "a2f97d59": {"commit": "a2f97d59", "share": 6000, "review": True,
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why]),
+                 # срок очереди В7′ — двое суток (стенд прыгает часами через него), прочие сроки — заведомо дальше стенда
+                 "terms": {"t_stuck": 10 ** 9, "t_dead": 10 ** 9, "t_nomonday": 10 ** 9, "t_serve": 10 ** 9,
+                           "t_queue_max": 2 * 24 * 3600}},
+    # ред. 9.5 (`work/pool-contract-fixC` @99dcf952 = 9.5 bc91f286 + стенды/шапка): пакеты A+B, ревью-2 (dumpState,
+    # постраничная история, DELAY >= 24 ч, сроки >= 2·DELAY), внеочередной расчёт monday(bool) и предел maxGens. Доля ног
+    # 5000 (решение оператора 21.10: две ноги 50/50). Разделы с таймлоком (final, review) здесь не идут: DELAY стенда
+    # теперь не 0, а их сценарии исполняют предложения сразу
+    "99dcf952": {"commit": "99dcf95253ad0d54bf4b88fc619e9ae8bd0c3ae7", "share": 5000, "delay": 86_400,
+                 "max_gens": 1000, "archive_extra": ("config/operational_limits.json",),
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why]),
+                 "terms": {"t_stuck": 10 ** 9, "t_dead": 10 ** 9, "t_nomonday": 10 ** 9, "t_serve": 10 ** 9,
+                           "t_queue_max": 10 ** 9}},
+    # ФИНАЛЬНЫЙ контракт (`work/pool-contract-fixC` @d064ffbe, заморожен): ред. 9.5 + ревью-3 (R3-A/B/I/M/P/S/T) и ревью-3b
+    # (календарный расчёт не чаще одного за календарную неделю `_calWeek`). Те же параметры, что у 99dcf952 — заведено
+    # слиянием 2026-10-22 (`work/pool-integration`), чтобы keeper и сторож судились на НАСТОЯЩЕМ финальном контракте
+    "d064ffbe": {"commit": "d064ffbe", "share": 5000, "delay": 86_400,
+                 "max_gens": 1000, "archive_extra": ("config/operational_limits.json",),
+                 "request": lambda amt: ("requestWithdraw(uint256,bool,bool)", [amt, False, False]),
+                 "refunded": ("DepositRefunded(address,uint64,uint64,bytes32,uint8)", [True, False, False, True, False],
+                              lambda to, wei, ref, why: [to, 0, wei, ref, why]),
+                 "terms": {"t_stuck": 10 ** 9, "t_dead": 10 ** 9, "t_nomonday": 10 ** 9, "t_serve": 10 ** 9,
+                           "t_queue_max": 10 ** 9}},
+}
+ARCHIVE_PATHS = ("contracts", "runtime", "analysis/e96_vault_research_gate.pytxt", "tests/fixtures/vault_accounting")
+
+
+class Crash(Exception):
+    pass
+
+
+def contract_tree(dst: str, commit: str = CONTRACT_COMMIT, extra=()):
+    """Исходники контракта редакции `commit` из истории + моки прекомпайлов этой ветки -> загруженный её дифференциал.
+    `extra` — пути, которые нужны дифференциалу этой редакции (ревью-2: параметры деплоя ссылаются на числа
+    `config/operational_limits.json`)."""
+    raw = subprocess.run(["git", "-C", ROOT, "archive", "--format=tar", commit, *ARCHIVE_PATHS, *extra],
+                         capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(raw)) as t:
+        t.extractall(dst, filter="data")
+    mocks = os.path.join(dst, "contracts", "test", "mocks"); os.makedirs(mocks, exist_ok=True)
+    shutil.copy(os.path.join(ROOT, "contracts", "test", "mocks", "CoreMocks.sol"), mocks)
+    return SourceFileLoader(f"pool_ledger_diff_{commit[:8]}", os.path.join(dst, "contracts", "diff",
+                                                                         "pool_ledger_diff.pytxt")).load_module()
+
+
+def run(edition: str = "ea165ccd") -> int:
+    from eth_account import Account
+    ok = []
+    ed = EDITIONS[edition]
+
+    def chk(name, cond, detail=""):
+        ok.append(bool(cond)); print(f"  [{'OK' if cond else 'FAIL'}] {name} {detail}")
+    print(f"редакция контракта {edition} ({ed['commit']})")
+    work = tempfile.mkdtemp(prefix=f"vault_rev9_stand_{edition}_")
+    D9 = contract_tree(os.path.join(work, "src"), ed["commit"], ed.get("archive_extra", ())); art = D9.build()
+    for call in VK.OPTIONAL_CALLS:
+        sig = ABI.selector(VK.CONTRACT_SIGS[call])
+        if sig not in art["vault"]["methodIdentifiers"].values():
+            raise ValueError(f"{VK.CONTRACT_SIGS[call]} keeper'а нет в ABI PoolVault {edition} — формы разошлись")
+    # раздел возврата — буфер 100 % (раздачи нет); разделы окон и событий — буфер 10 % (раздача ногам). Своя цепь на
+    # раздел: «Core» стенда исполняет ВСЕ действия CoreWriter цепи, и два хранилища на одной цепи он исполнил бы дважды
+    sections = [("refund", "10000", section_refund), ("windows", "1000", section_windows)]
+    if edition == "de2666d7":
+        sections.append(("events", "1000", section_events))
+    if edition in ("ba1d6abb", "c3deb740", "a2f97d59"):
+        sections.append(("final", "1000", section_final))
+    if ed.get("review"):
+        sections.append(("review", "1000", section_review))
+    if "max_gens" in ed:
+        sections.append(("rev95", "1000", section_rev95))
+    for name, buffer_bps, section in sections:
+        # раздел ред. 9.5 — свой предел поколений (4: половина — 2), чтобы клапан и предел были достижимы стенду
+        w = World9(D9, art, os.path.join(work, name), Account, buffer_bps,
+                   dict(ed, max_gens=4) if name == "rev95" else ed)
+        try:
+            section(w, chk, Account)
+        finally:
+            w.close()
+    shutil.rmtree(work)                                   # дерево ea165ccd и сборка — временные (fail-loud, если не снялось)
+    n = len(ok); p = sum(ok)
+    print(f"STAND: {'PASS' if p == n else 'FAIL'} ({p}/{n})")
+    return 0 if p == n else 1
+
+
+class World9:
+    """Своя цепь anvil, моки прекомпайлов, деплой КЕ10 контракта ea165ccd, «Core» стенда, keeper из конфига."""
+    def __init__(self, D9, art, work, Account, buffer_bps, ed):
+        self.work = work; self.ed = ed; os.makedirs(work, exist_ok=True)
+        self.chain = chain = D9.Chain()
+        out = os.path.join(os.path.dirname(work), "src", "contracts", "out", "CoreMocks.sol")
+        pc = {k: KS.E96.hl_constant_address(k) for k in VK.PRECOMPILES}
+        for name, key in KS.MOCKS.items():
+            chain.rpc("anvil_setCode", pc[key], json.load(open(os.path.join(out, f"{name}.json"), encoding="utf-8"))[
+                "deployedBytecode"]["object"])
+        chain.rpc("anvil_setCode", KS.CORE_WRITER, json.load(open(os.path.join(out, "CoreWriterMock.json"),
+                                                                  encoding="utf-8"))["deployedBytecode"]["object"])
+        self.acct = acct = Account.create(); key = "0x" + bytes(acct.key).hex()
+        chain.rpc("anvil_setBalance", acct.address, hex(10 ** 20))
+        self.treasury = Account.create().address
+        consts = dict(D9.rehearsal_constants())
+        consts.update(treasury=self.treasury.lower(), buffer_bps=buffer_bps, min_deposit=str(10 * MICRO),
+                      max_investors=10)
+        if "max_gens" in ed:
+            consts["max_gens"] = ed["max_gens"]
+        roles = {"admin": chain.me, "keeper": acct.address, "guardian": Account.create().address,
+                 "delay": ed.get("delay", 0), "tvl_cap": 10 ** 15}
+        if ed["share"] is not None:
+            roles["leg_share_bps"] = ed["share"]
+        if "terms" in ed:
+            roles["terms"] = dict(ed["terms"])
+        m = D9.deploy_pool(chain, art, consts, roles)
+        self.vault = vault = m["parts"]["PoolVault"]["address"].lower()
+        deploy_block = int(chain.rpc("eth_blockNumber"), 16)
+        get = lambda s_: ABI.decode(["address"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+            s_, [])}, "latest")))[0].lower()
+        self.legs = [get("legA()"), get("legB()")]
+        self.clk = {"t": int(datetime(2027, 1, 13, 12, tzinfo=timezone.utc).timestamp() * 1000)}
+        self.core = core = KS.Core(chain, vault, self.legs, pc, self.clk); core.last_block = deploy_block
+        self.inv, self.inv2 = Account.create().address, Account.create().address
+        for a in [vault] + self.legs + [self.inv, self.inv2, self.treasury]:
+            core.activate(a)
+        core.set_bal(self.inv, 1_000 * 10 ** 8); core.set_bal(self.inv2, 1_000 * 10 ** 8)
+        core.px.update(BTC=Decimal(50000), ETH=Decimal(2500)); core.sync_perp()
+        self.cfg = WS.config(work, chain, vault, deploy_block)
+        self.env = {VC.KEY_ENV: key}
+        VK.init_journal(self.cfg, self.env)
+        self.jpath = VK.journal_path(self.cfg)
+        self.W = OB.OutboxWriter(self.cfg["pool"]["trading_legs"][0]["outbox"], self.legs[0])
+        self.st = {}
+
+    def keeper_(self):
+        self.st["k"], self.st["tx"] = VK.build_from_config(self.cfg, env=self.env, post=self.core.post,
+                                                           now_ms=lambda: self.clk["t"])
+
+    def restart(self):
+        self.st["k"].close(); self.st["tx"].close(); self.keeper_()
+
+    def step(self, n=1):
+        for _ in range(n):
+            self.clk["t"] += 1_000; KS.chain_time(self.chain, self.clk); self.W.hb(self.clk["t"])
+            self.st["k"].step(); self.clk["t"] += 1; self.core.apply_actions()
+
+    def send_wei(self, frm, wei):
+        core = self.core
+        core.set_bal(frm, core.bal(frm) - wei); core.set_bal(self.vault, core.bal(self.vault) + wei)
+        self.clk["t"] += 1_000; rec = core._rec(frm, self.vault, wei)
+        return rec, VK.row_ref({"rec": rec})
+
+    def txs(self):
+        return int(self.chain.rpc("eth_getTransactionCount", self.acct.address, "latest"), 16)
+
+    def events(self, sig, ix, topics_tail=()):
+        return [(ABI.decode_log(lg, sig, ix)["args"], int(lg["blockNumber"], 16)) for lg in self.chain.rpc(
+            "eth_getLogs", {"address": self.vault, "fromBlock": "0x0", "toBlock": "latest",
+                            "topics": [ABI.topic(sig), *topics_tail]})]
+
+    def refunded_events(self, ref):
+        sig, ix, _ = self.ed["refunded"]
+        return [a for a, _ in self.events(sig, ix, (None, "0x" + ABI.hexbytes(ref).hex()))]
+
+    def request_withdraw(self, frm, amt, all_=False):
+        sig, args = self.ed["request"](amt)
+        if all_:
+            if not sig.endswith(",bool,bool)"):
+                raise ValueError(f"«вывести всё» — только у трёхаргументной заявки, а не {sig}")
+            args = [0, False, True]
+        self.chain.rpc("anvil_impersonateAccount", frm); self.chain.rpc("anvil_setBalance", frm, hex(10 ** 20))
+        rc = self.chain.receipt(self.chain.rpc("eth_sendTransaction", {"from": frm, "to": self.vault, "data":
+                                                                        ABI.encode_call(sig, args), "gas": hex(1_000_000)}))
+        if int(rc["status"], 16) != 1:
+            raise ValueError(f"стенд: {sig} от {frm} отклонён")
+        return rc
+
+    def watch(self, sub, later=0):
+        """Прогон сторожа на этой цепи СВОИМ RPC: часы вперёд (записи старше метки блока), блок по часам."""
+        clk, chain, cfg = self.clk, self.chain, self.cfg
+        clk["t"] += 2_000 + later; KS.chain_time(chain, clk); clk["t"] += 2_000; KS.chain_time(chain, clk)
+        P = VW.params_from_config(cfg); P["state_dir"] = os.path.join(self.work, sub)
+        r = cfg["watch"]["rpc"]
+        wr = RPC.EvmRpc(RPC.HttpTransport(r["url"], timeout_s=r["timeout_s"]), expected_chain_id=chain.chain_id,
+                        limiter=RPC.Limiter(r["state_dir"], RPC.scope_slug(r["url"], None), r["limit_per_min"],
+                                            max_wait_s=r["max_wait_s"]))
+        wr.verify_chain()
+        x = VW.Watch(P, VW.EvmViews(wr, self.vault, cfg["pool"]["precompiles"]), self.core.post, now_ms=lambda: clk["t"])
+        try:
+            return x.run_once()
+        finally:
+            x.close()
+
+    def status(self, ref):
+        return self.st["k"].decisions[ref]["status"]
+
+    def close(self):
+        if self.st:
+            self.st["k"].close(); self.st["tx"].close()
+        self.W.close(); self.chain.close()
+
+
+def section_refund(w, chk, Account):
+    chain, core, inv, inv2, vault, cfg, env, jpath, clk, st = (w.chain, w.core, w.inv, w.inv2, w.vault, w.cfg, w.env,
+                                                               w.jpath, w.clk, w.st)
+    keeper_, restart, step, send_wei, txs, refunded_events, status = (w.keeper_, w.restart, w.step, w.send_wei, w.txs,
+                                                                      w.refunded_events, w.status)
+    work = w.work
+    keeper_()
+    chk("RF-A0: keeper видит refundDeposit в КОДЕ контракта (необязательный вызов)",
+        st["k"].client.supports("refundDeposit"))
+    # --- RF-A1: ниже минимума, хвост мельче микро --- #
+    b_inv = core.bal(inv); b_vault = core.bal(vault)
+    rec1, ref1 = send_wei(inv, 500_000_001); n0 = txs(); step(3)
+    ev1 = refunded_events(ref1)
+    chk("RF-A1a: Send 5.00000001 < 10 -> refundDeposit, на цепи DepositRefunded(отправитель, 500000001 wei, ref, "
+        "below_min) формы этой редакции; транзакция одна", ev1 == [w.ed["refunded"][2](
+            inv.lower(), 500_000_001, ABI.hexbytes(ref1), VK.REFUND_REASON["below_min"])] and txs() == n0 + 1, f"{ev1}")
+    step(2)
+    rc = st["k"].reconcile()
+    chk("RF-A1b: деньги вернулись отправителю ровно (Core), хранилище — как до Send; решение refunded по исходящей "
+        "записи Core; сверка G1 судима и в допуске", core.bal(inv) == b_inv and core.bal(vault) == b_vault
+        and status(ref1) == "refunded" and rc["judged"] and rc["ok"] and not st["k"].money_blocked(),
+        f"inv {core.bal(inv) - b_inv} vault {core.bal(vault) - b_vault} {status(ref1)} {rc}")
+    # сторож на этой цепи: W3b по настоящему событию возврата
+    clk["t"] += 2_000; KS.chain_time(chain, clk); clk["t"] += 2_000; KS.chain_time(chain, clk)
+    P = VW.params_from_config(cfg); P["state_dir"] = os.path.join(work, "watch_a1")
+    r = cfg["watch"]["rpc"]
+    wr = RPC.EvmRpc(RPC.HttpTransport(r["url"], timeout_s=r["timeout_s"]), expected_chain_id=chain.chain_id,
+                    limiter=RPC.Limiter(r["state_dir"], RPC.scope_slug(r["url"], None), r["limit_per_min"],
+                                        max_wait_s=r["max_wait_s"]))
+    wr.verify_chain()
+    w = VW.Watch(P, VW.EvmViews(wr, vault, cfg["pool"]["precompiles"]), core.post, now_ms=lambda: clk["t"])
+    try:
+        rep = w.run_once()
+    finally:
+        w.close()
+    refunds_seen = rep["findings"]
+    chk("RF-A1c: сторож на цепи зелен — возврат отправителю на его сумму (W3b), Send закрыт (W2)",
+        refunds_seen == [], f"{sorted({(f['w'], f['sev']) for f in rep['findings']})}")
+    # --- RF-A2: ручная очередь -> подхвачена рестартом --- #
+    orig_sup = VK.EvmVaultClient.supports
+    VK.EvmVaultClient.supports = lambda self_, c: False if c == "refundDeposit" else orig_sup(self_, c)
+    try:
+        restart(); rec2, ref2 = send_wei(inv2, 3 * 10 ** 8); step(3)
+        was = status(ref2)
+    finally:
+        VK.EvmVaultClient.supports = orig_sup
+    n0 = txs(); restart(); step(4)
+    chk("RF-A2: Send, ушедший в ручную очередь (manual), пока keeper не видел refundDeposit, — подхвачен рестартом "
+        "(решение в журнале), возвращён отправителю и подтверждён", was == "manual" and status(ref2) == "refunded"
+        and txs() == n0 + 1 and len(refunded_events(ref2)) == 1, f"{was} -> {status(ref2)}")
+    # --- RF-A3: падение между подписью и квитанцией --- #
+    orig_poll = RPC.TxManager.poll
+
+    def crash_poll(self_, op_id):
+        if op_id.startswith("refund:"):
+            RPC.TxManager.poll = orig_poll; raise Crash("refundDeposit подписан и отправлен, квитанции не видели")
+        return orig_poll(self_, op_id)
+    rec3, ref3 = send_wei(inv, 4 * 10 ** 8); n0 = txs(); RPC.TxManager.poll = crash_poll
+    try:
+        step(3); crashed = False
+    except Crash:
+        crashed = True
+    finally:
+        RPC.TxManager.poll = orig_poll
+    restart(); step(4)
+    chk("RF-A3: падение между подписью refundDeposit и квитанцией -> рестарт (тот же raw): транзакция одна, событие "
+        "одно, refunded", crashed and txs() == n0 + 1 and len(refunded_events(ref3)) == 1 and status(ref3) == "refunded",
+        f"{crashed} tx {txs() - n0} {status(ref3)}")
+    # --- RF-A4: падение после майнинга + потеря журнала nonce --- #
+    orig_mined = VK.VaultKeeper._out_mined
+
+    def crash_mined(self_, op, *a, **kw):
+        if op.startswith("refund:"):
+            VK.VaultKeeper._out_mined = orig_mined; raise Crash("refundDeposit замайнен, payout_mined не записан")
+        return orig_mined(self_, op, *a, **kw)
+    rec4, ref4 = send_wei(inv2, 6 * 10 ** 8); n0 = txs(); VK.VaultKeeper._out_mined = crash_mined
+    try:
+        step(3); crashed = False
+    except Crash:
+        crashed = True
+    finally:
+        VK.VaultKeeper._out_mined = orig_mined
+    core.apply_actions()                               # Core исполняет действие замайненного блока и без keeper'а
+    st["k"].close(); st["tx"].close()
+    os.replace(jpath, jpath + ".lost"); VK.init_journal(cfg, env); keeper_(); step(4)
+    chk("RF-A4: падение после майнинга refundDeposit и ПОТЕРЯ журнала nonce -> ledger_ref used -> DepositRefunded(ref) "
+        "на цепи тому же адресу -> refund_sent_by_chain, второй транзакции нет, подтверждено",
+        crashed and txs() == n0 + 1 and len(refunded_events(ref4)) == 1 and status(ref4) == "refunded"
+        and not st["k"].money_blocked() and any(json.loads(l)["what"] == "refund_already_on_chain" and
+                                                json.loads(l)["ref"] == ref4 for l in open(st["k"].inc_path, encoding="utf-8")), f"{crashed} tx {txs() - n0} {status(ref4)} {st['k'].money_blocked()}")
+    # --- RF-A5: отказ контракта (адресат не на Core) --- #
+    stranger = Account.create().address; core.set_bal(stranger, 10 ** 8)       # Core-счёт есть, флага активации нет
+    rec5, ref5 = send_wei(stranger, 10 ** 8); n0 = txs(); step(3)
+    blocked = st["k"].money_blocked()
+    chk("RF-A5: refundDeposit отвергнут контрактом (NotActivated адресата) — стоп денежных операций с именем отказа, "
+        "транзакции нет, деньги на месте", blocked and "NotActivated" in blocked and txs() == n0
+        and status(ref5) == "open" and not refunded_events(ref5), f"{blocked} tx {txs() - n0}")
+
+
+def section_windows(w, chk, Account):
+    """Окна ног ea165ccd: раздача -> подтверждение -> зачисление не висит на LegBusy; вывод с ноги -> confirmLegSend;
+    рестарт посреди окна; потеря журнала nonce после подтверждения; отказ (раздача молча не дошла)."""
+    chain, core, inv, inv2, vault, cfg, env, clk, st = (w.chain, w.core, w.inv, w.inv2, w.vault, w.cfg, w.env, w.clk, w.st)
+    step, txs = w.step, w.txs
+    LC = VK.LEG_CONFIRMED
+
+    def win(i):
+        return ABI.decode(["uint64", "uint64", "uint64", "bool"], ABI.hexbytes(chain.rpc("eth_call", {
+            "to": vault, "data": ABI.encode_call("windows(uint256)", [i])}, "latest")))
+
+    def confirms(since=0):
+        return [(a_[0], a_[1], a_[2], a_[3], b_) for a_, b_ in w.events(LC[0], LC[1]) if b_ >= since]
+
+    def purposes():
+        j = RPC.NonceJournal(w.jpath)
+        return [op["planned"]["purpose"] for op in j.ops.values() if op["signed"]]
+
+    def credited(a_):
+        return [x for x, _ in w.events("DepositCredited(address,uint256,bytes32)", [True, False, False],
+                                       ("0x" + ABI.enc_word("address", a_).hex(),))]
+    w.keeper_()
+    share = w.ed["share"] if w.ed["share"] is not None else VK.BPS // 2
+    pa = lambda mv: mv * share // VK.BPS                              # нога A — доля вниз, нога B — остаток
+    chk(f"WIN-0: keeper видит confirmSweep/confirmLegSend в КОДЕ контракта; доля ноги A {share} bps "
+        f"({'геттер legShareBps' if w.ed['share'] is not None else 'геттера нет — пополам'})",
+        st["k"].client.supports("confirmSweep") and st["k"].client.supports("confirmLegSend")
+        and st["k"].client.leg_share_bps() == share)
+    # WIN-A1: депозит -> раздача (окна) -> приход -> confirmSweep -> legToPerp; зачисление после — не на LegBusy
+    # WIN-A0: нога A не на Core (как на testnet-стенде до активации) — раздача отвергнута NotActivated: keeper ждёт с
+    # именованным инцидентом по переходу, транзакций раздачи нет, стопа нет; нога активирована — раздача пошла
+    core._send_tx(core.pc["CORE_USER_EXISTS_PRECOMPILE_ADDRESS"], "setExists(address,bool)", [w.legs[0], False])
+    clk["t"] += 10; core.send(inv, vault, 300); b0 = int(chain.rpc("eth_blockNumber"), 16)
+    reps = []
+    for _ in range(4):
+        clk["t"] += 1_000; KS.chain_time(chain, clk); w.W.hb(clk["t"])
+        reps.append(st["k"].step()["sweep"]); clk["t"] += 1; core.apply_actions()
+    incs0 = [json.loads(l)["what"] for l in open(st["k"].inc_path, encoding="utf-8")]
+    chk("WIN-A0: нога A не активирована — симуляция раздачи отвергнута NotActivated: «refused:NotActivated», а не "
+        "«nothing»; инцидент sweep_refused один за 4 шага; транзакции раздачи нет; стопа нет",
+        reps[-1] == "refused:NotActivated" and incs0.count("sweep_refused") == 1 and "sweepToLegs" not in purposes()
+        and not st["k"].money_blocked(), f"{reps} {incs0.count('sweep_refused')}")
+    core.activate(w.legs[0]); step(6)
+    cf = confirms(b0); pp = purposes()
+    a_, b_ = pa(270), 270 - pa(270)
+    chk(f"WIN-A1: раздача 270 -> обе ноги получили -> confirmSweep (одна транзакция, LegTransferConfirmed arrived у обеих) "
+        f"-> legToPerp; окна закрыты, perp ног {a_}/{b_} (доля конструктора)",
+        sorted((c[0], c[1], c[2], c[3]) for c in cf) == [(0, False, a_ * MICRO, True), (1, False, b_ * MICRO, True)]
+        and pp.count("confirmSweep") == 1 and win(0)[0] == 0 and win(1)[0] == 0
+        and core.perp[w.legs[0]] == Decimal(a_) and core.perp[w.legs[1]] == Decimal(b_) and not st["k"].money_blocked(),
+        f"{cf} {pp} perp {core.perp} halt {st['k'].money_blocked()}")
+    order = [x for x in pp if x in ("sweepToLegs", "confirmSweep", "legToPerp")]
+    chk("WIN-A1b: порядок транзакций keeper'а: sweepToLegs -> confirmSweep -> legToPerp ×2",
+        order == ["sweepToLegs", "confirmSweep", "legToPerp", "legToPerp"], f"{order}")
+    clk["t"] += 10; core.send(inv2, vault, 50); step(3)
+    chk("WIN-A1c: зачисление ПОСЛЕ раздачи прошло на настоящем контракте (окна подтверждены — не LegBusy)",
+        [x[1] for x in credited(inv2)] == [50 * MICRO] and not st["k"].money_blocked(), f"{credited(inv2)}")
+    # WIN-A2: заявка -> legToSpot -> legSendToVault -> приход «с ноги» -> confirmLegSend -> processWithdrawals -> claimFor
+    w.request_withdraw(inv, 80 * MICRO); before = core.bal(inv); b1 = int(chain.rpc("eth_blockNumber"), 16); step(16)
+    cf = [c for c in confirms(b1) if c[1]]; pp = purposes()
+    paid = [p_ for p_ in st["k"].payouts.values() if p_["addr"] == inv.lower()]
+    chk("WIN-A2: вывод: legSendToVault на каждую ногу -> confirmLegSend (arrived) -> processWithdrawals -> claimFor "
+        "подтверждён Core; окна закрыты",
+        pp.count("legSendToVault") >= 1 and pp.count("confirmLegSend") == pp.count("legSendToVault")
+        and all(c[3] for c in cf) and len(cf) == pp.count("legSendToVault") and paid and paid[-1]["status"] == "verified"
+        and core.bal(inv) > before and win(0)[0] == 0 and win(1)[0] == 0 and not st["k"].money_blocked(),
+        f"{pp} {cf} {paid} halt {st['k'].money_blocked()}")
+    rc = st["k"].reconcile()
+    chk("WIN-A2b: сверка после раздачи и вывода — судима и в допуске", rc["judged"] and rc["ok"], f"{rc}")
+    # WIN-A3: рестарт посреди окна — раздача замайнена, ноги получили, keeper упал ДО подтверждения
+    orig_cw = VK.VaultKeeper._confirm_window
+
+    def crash_cw(self_, op, *a_, **kw):
+        VK.VaultKeeper._confirm_window = orig_cw
+        raise Crash(f"{op}: окно открыто, подтверждения нет")
+    step(3); pp0 = purposes()                                         # дорабатывает всё прежнее (раздача после A1c)
+    clk["t"] += 10; core.send(inv2, vault, 200); b2 = int(chain.rpc("eth_blockNumber"), 16)
+    VK.VaultKeeper._confirm_window = crash_cw; crashed = False; open_at_crash = None
+    try:
+        for _ in range(6):
+            step()
+    except Crash:
+        crashed = True; core.apply_actions(); open_at_crash = (win(0)[0] != 0, win(1)[0] != 0)
+    finally:
+        VK.VaultKeeper._confirm_window = orig_cw
+    w.restart(); step(5)
+    pp = purposes(); cf = confirms(b2)
+    chk("WIN-A3: падение посреди окна (раздача замайнена, окна открыты) -> рестарт: одно подтверждение, раздача не "
+        "повторена, окна закрыты", crashed and open_at_crash == (True, True)
+        and pp.count("sweepToLegs") == pp0.count("sweepToLegs") + 1
+        and pp.count("confirmSweep") == pp0.count("confirmSweep") + 1 and len([c for c in cf if not c[1]]) == 2
+        and win(0)[0] == 0
+        and not st["k"].money_blocked(), f"{crashed} {open_at_crash} {pp} {cf} {st['k'].money_blocked()}")
+    # WIN-A4: подтверждение замайнено, keeper упал и журнал nonce ПОТЕРЯН -> исход по LegTransferConfirmed на цепи
+    orig_exec = VK.EvmVaultClient.execute
+
+    def crash_after_confirm(self_, op_id, call, args):
+        m = orig_exec(self_, op_id, call, args)
+        if call == "confirmSweep" and m is not None:
+            VK.EvmVaultClient.execute = orig_exec; raise Crash("confirmSweep замайнен, ответ не обработан")
+        return m
+    clk["t"] += 10; core.send(inv2, vault, 200)
+    VK.EvmVaultClient.execute = crash_after_confirm; crashed = False
+    try:
+        for _ in range(6):
+            step()
+    except Crash:
+        crashed = True; core.apply_actions()
+    finally:
+        VK.EvmVaultClient.execute = orig_exec
+    st["k"].close(); st["tx"].close()
+    os.replace(w.jpath, w.jpath + ".lost"); VK.init_journal(cfg, env); w.keeper_(); step(5)
+    incs = [json.loads(l)["what"] for l in open(st["k"].inc_path, encoding="utf-8")]
+    perp_tx = [x for x in purposes() if x == "legToPerp"]          # журнал новый: только доведение этой раздачи
+    chk("WIN-A4: confirmSweep замайнен, журнал nonce потерян -> NoWindow, окон нет, LegTransferConfirmed(arrived) на "
+        "цепи -> засчитано без второго подтверждения; раздача доведена (legToPerp)",
+        crashed and "leg_confirm_already_on_chain" in incs and "confirmSweep" not in purposes()
+        and len(perp_tx) == 2 and not st["k"].money_blocked() and st["k"].sw is None,
+        f"{crashed} {incs[-3:]} {purposes()} sw {st['k'].sw} {st['k'].money_blocked()}")
+    # WIN-A5: отказ — Core молча не доставил раздачу: keeper прихода не видит, confirmSweep не зовёт; окна открыты,
+    # притоки контракт отвергает (LegBusy), keeper встаёт по сроку окна — решение человека
+    clk["t"] += 10; core.send(inv2, vault, 200); core.silent_reject = True; step(3)
+    core.silent_reject = False
+    clk["t"] += cfg["keeper"]["confirm_window_ms"] + 1_000; step(2)
+    ops_ = RPC.NonceJournal(w.jpath).ops
+    sent_confirm = [op for op in ops_.values() if op["planned"]["purpose"] == "confirmSweep" and op["signed"]]
+    chk("WIN-A5: раздача молча не дошла -> confirmSweep не подписан, окна открыты, стоп денежных операций",
+        not sent_confirm and (win(0)[0] != 0 or win(1)[0] != 0) and bool(st["k"].money_blocked()),
+        f"{sent_confirm} {win(0)} {win(1)} {st['k'].money_blocked()}")
+
+
+def section_events(w, chk, Account):
+    """de2666d7: сторож по СОБЫТИЯМ на честном потоке; «вывести всё» и запас газа заявок на НАСТОЯЩЕМ контракте;
+    саботажи ключом keeper'а/admin'а — каждый красит свою проверку сторожа."""
+    chain, core, inv, inv2, vault, cfg, clk, st = (w.chain, w.core, w.inv, w.inv2, w.vault, w.cfg, w.clk, w.st)
+    step, W = w.step, w.W
+    K = w.acct.address
+
+    def as_(frm, sig, args, gas=5_000_000):
+        KS.chain_time(chain, clk); chain.rpc("anvil_impersonateAccount", frm)
+        rc = chain.receipt(chain.rpc("eth_sendTransaction", {"from": frm, "to": vault, "data": ABI.encode_call(sig, args),
+                                                             "gas": hex(gas)}))
+        if int(rc["status"], 16) != 1:
+            raise ValueError(f"стенд: {sig} от {frm} отклонён")
+        return rc
+
+    def view(sig, args, out):
+        return ABI.decode(out, ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(sig, args)},
+                                                      "latest")))
+
+    def gas_limit(v):
+        chain.rpc("evm_setBlockGasLimit", hex(v)); chain.rpc("evm_mine")
+        return int(chain.rpc("eth_getBlockByNumber", "latest", False)["gasLimit"], 16)
+
+    def signed(purpose):
+        j = RPC.NonceJournal(w.jpath)
+        return [v_ for op in j.ops.values() if op["planned"]["purpose"] == purpose for v_ in op["signed"]]
+
+    def kinds(rep):
+        return sorted({(f["w"], f["sev"]) for f in rep["findings"]})
+    w.keeper_(); k = st["k"]
+    ed = VW.edition_of(chain.rpc("eth_getCode", vault, "latest"))
+    chk("EV-A0: редакция по КОДУ настоящего контракта: сторож — все группы событий (покрытие, ордера, расчёт); keeper — "
+        "запас газа CALL_GAS на заявку (PUSH4 WITHDRAW_GAS_MAX)",
+        ed == {"cover": True, "orders": True, "monday": True, "reduce": False}
+        and k.client.withdraw_gas_reserve([{"all": False}]) == VK.WITHDRAW_CALL_GAS
+        and k.client.withdraw_gas_reserve([{"all": True}]) == 2 * VK.WITHDRAW_CALL_GAS, f"{ed}")
+    # --- EV-A1: честный поток --- #
+    lim = gas_limit(30_000_000)                                        # большой блок HyperEVM (замер e96 2026-09-23)
+    clk["t"] += 10; core.send(inv, vault, 300); step(6)
+    cl1 = "0x" + "1" * 32; clk["t"] += 10
+    W.write("size", clk["t"], copy_id="c1", coin="BTC", side=1, notional_micro=100 * MICRO, leg_seq=0, cloid=cl1)
+    step(); core.trade(w.legs[0], "BTC", "B", "0.002", "50000", "0.05", cl1); step(2)
+    W.write("entry_done", clk["t"] + 1, copy_id="c1", leg_seq=0, sized_qty="0.002", filled_qty="0.002", reason="filled")
+    step(); core.px["BTC"] = Decimal(50400); core.sync_perp(); step(2)
+    cl2 = "0x" + "2" * 32; clk["t"] += 10
+    W.write("exit_bind", clk["t"], cloid=cl2, parent_cloid=None, copies=[{"copy_id": "c1", "qty": "0.002"}])
+    core.trade(w.legs[0], "BTC", "A", "0.002", "52000", "0.052", cl2); step(3)
+    T = int(datetime(2027, 1, 18, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    clk["t"] = T - 120_000; step(); clk["t"] = T + 30 * 60_000; step(6)
+    names = lambda n_: len(w.events(VW.EVENTS[n_][0], VW.EVENTS[n_][1]))
+    seen = {n_: names(n_) for n_ in ("OrderSized", "OrderFilled", "PositionMarked", "PositionClosed", "MondaySettled",
+                                     "WithdrawableSet")}
+    rep = w.watch("ev1", later=cfg["watch"]["monday_sla_ms"])
+    chk("EV-A1: честный поток de2666d7 (депозит -> раздача -> вход/марк/закрытие -> понедельник): события ордера и расчёта "
+        "на цепи; сторож по событиям зелен (свёртка = снимку, Σ realized, MondaySettled), keeper не встал",
+        lim == 30_000_000 and all(seen[n_] >= 1 for n_ in seen) and rep["findings"] == [] and rep["w6"]["judged"]
+        and not k.money_blocked(), f"gasLimit {lim} {seen} {kinds(rep)} {rep['findings'][:2]}")
+    # --- EV-A2: «вывести всё» --- #
+    led = view("ledger()", [], ["address"])[0]
+    free = ABI.decode(["int256"], ABI.hexbytes(chain.rpc("eth_call", {"to": led, "data": ABI.encode_call(
+        "freeStake(address,bool)", [inv, False])}, "latest")))[0]
+    w.request_withdraw(inv, 0, all_=True); before = core.bal(inv); n_pw0 = len(signed("processWithdrawals"))
+    reps = [None] * 4
+    for i_ in range(4):
+        clk["t"] += 1_000; KS.chain_time(chain, clk); W.hb(clk["t"]); reps[i_] = k.step()["payouts"]; clk["t"] += 1
+        core.apply_actions()
+    incs = [json.loads(l)["what"] for l in open(k.inc_path, encoding="utf-8")]
+    pend = k.client.pending_intents()
+    chk("EV-A2a: «вывести всё» при лимите блока 30M: оценка + 2×CALL_GAS не помещается — wait_gas, инцидент "
+        "process_withdrawals_needs_big_block один, транзакции нет; заявка читается как «всё» на свободную долю",
+        reps == ["wait_gas"] * 4 and incs.count("process_withdrawals_needs_big_block") == 1
+        and len(signed("processWithdrawals")) == n_pw0 and pend and pend[0]["all"] and pend[0]["amount"] == free > 0
+        and not k.money_blocked(), f"{reps} {incs[-3:]} {pend} free {free}")
+    gas_limit(45_000_000); step(18)
+    sg = signed("processWithdrawals")[n_pw0:]
+    paid = [p_ for p_ in k.payouts.values() if p_["addr"] == inv.lower()]
+    nxt = view("nextIntent()", [], ["uint256"])[0]
+    chk("EV-A2b: лимит блока 45M — «всё» исполнено ОДНОЙ транзакцией с газом >= 2×CALL_GAS (nextIntent сдвинут), "
+        "выведено и выплачено (claimFor подтверждён Core)", len(sg) == 1 and sg[0]["gas"] >= 2 * VK.WITHDRAW_CALL_GAS
+        and nxt == 1 and paid and paid[-1]["status"] == "verified" and core.bal(inv) > before
+        and not k.money_blocked(), f"{[x['gas'] for x in sg]} next {nxt} {paid[-1:] } halt {k.money_blocked()}")
+    # --- EV-A3: саботаж keeper'а — газ без запаса: НАСТОЯЩИЙ контракт майнит пустую транзакцию --- #
+    clk["t"] += 10; core.send(inv2, vault, 100); step(5)
+    orig = VK.EvmVaultClient.withdraw_gas_reserve
+    VK.EvmVaultClient.withdraw_gas_reserve = lambda self_, intents: 0
+    try:
+        w.request_withdraw(inv2, 20 * MICRO); n0 = len(signed("processWithdrawals")); step(6)
+    finally:
+        VK.EvmVaultClient.withdraw_gas_reserve = orig
+    sg = signed("processWithdrawals")[n0:]; blocked = k.money_blocked()
+    nxt3 = view("nextIntent()", [], ["uint256"])[0]
+    chk("EV-A3/SAB: газ = оценке (без запаса) — контракт de2666d7 майнит processWithdrawals ПУСТЫМ (оценка нашла путь "
+        "«ничего не сделал», газ < CALL_GAS), nextIntent на месте; keeper встал с именем, повтора нет",
+        len(sg) == 1 and sg[0]["gas"] < VK.WITHDRAW_CALL_GAS and nxt3 == 1 and blocked
+        and "nextIntent не сдвинулся" in blocked, f"{[x['gas'] for x in sg]} next {nxt3} {blocked}")
+    st["k"].close(); st["tx"].close(); st.clear()                     # дальше — ключи (impersonate), keeper'а нет
+    # --- EV-S: саботажи со снимка --- #
+    outbox = cfg["pool"]["trading_legs"][0]["outbox"]; ob_bytes = open(outbox, "rb").read()
+    base = {"snap": chain.rpc("evm_snapshot"), "clk": clk["t"]}
+    sla = VC.watch_slas(cfg); n_s = [0]
+
+    def restore():
+        chain.rpc("evm_revert", base["snap"]); base["snap"] = chain.rpc("evm_snapshot")
+        clk["t"] = base["clk"]; open(outbox, "wb").write(ob_bytes)
+        if os.path.exists(cfg["pool"]["halt_file"]):
+            os.remove(cfg["pool"]["halt_file"])                    # стоп прошлого саботажа снимает «человек»
+
+    def sab(name, mutate, want, sev=VW.SEV_HALT, later=0):
+        restore(); mutate(); n_s[0] += 1
+        rep_ = w.watch(f"s{n_s[0]}", later=later)
+        got = [f for f in rep_["findings"] if f["key"].startswith(want) and f["sev"] == sev]
+        want_halt = any(f["sev"] == VW.SEV_HALT for f in rep_["findings"])
+        chk(f"{name} -> {want}/{sev}", bool(got) and rep_["halt_present"] == want_halt,
+            f"{kinds(rep_)} {[f['key'][:60] for f in rep_['findings']][:4]}")
+        return rep_
+    restore(); r0 = w.watch("s0", later=sla["w9_sla_ms"])
+    chk("EV-S0: снимок мира перед саботажами — сторож зелен (висящая заявка inv2 и стоп keeper'а — не нарушения цепи)",
+        r0["findings"] == [], f"{kinds(r0)} {r0['findings'][:2]}")
+
+    def wrong_size():
+        clk["t"] += 10                                  # писатель журнала ноги один — тот же, что у мира
+        W.write("size", clk["t"], copy_id="c5", coin="ETH", side=-1, notional_micro=40 * MICRO, leg_seq=0,
+                cloid="0x" + "5" * 32)
+        W.hb(clk["t"] + 1)
+        as_(K, "sizeOrder(bytes32,uint256)", [ABI.hexbytes(VW.pid_of(w.legs[0], "c5", 0, 0)), 30 * MICRO])
+    sab("EV-S1: sizeOrder ключом keeper'а на нотионал не того решения бота", wrong_size, "W9:notional",
+        later=sla["w9_sla_ms"])
+    T4 = int(datetime(2027, 1, 25, 4, tzinfo=timezone.utc).timestamp() * 1000)
+
+    def early():
+        clk["t"] = T4 - 3_600_000; as_(K, "monday()", [], gas=20_000_000)        # расчёт W04 в воскресенье
+    sab("EV-S2: расчёт недели ключом keeper'а раньше T_пн (по блоку MondaySettled)", early, "W8:early",
+        later=T4 + sla["monday_sla_ms"] - (T4 - 3_600_000))
+
+    def share():
+        as_(chain.me, "proposeLegShare(uint256)", [VK.BPS])
+    r_p = sab("EV-S3a: admin предложил долю ног (таймлок) — тревога, пока предложение висит", share, "WR:proposed",
+              sev=VW.SEV_ALERT)
+    as_(chain.me, "applyLegShare(uint256)", [VK.BPS]); r_a = w.watch(f"s{n_s[0]}")
+    keys = sorted(f["key"].split(":")[1] for f in r_a["findings"])
+    chk("EV-S3b: доля применена — LegShareSet: тревога (одноразово), предложение снято, стопа нет",
+        keys == ["LegShareSet"] and not r_a["halt_present"] and view("legShareBps()", [], ["uint256"])[0] == VK.BPS,
+        f"{keys} {kinds(r_a)}")
+
+
+def section_final(w, chk, Account):
+    """ba1d6abb (финальная): заявки без запаса газа (нехватка газа откатывает транзакцию — IntentStarved), сторож по
+    событиям на честном потоке; аварийный выход: объявление admin'а -> стоп keeper'а и сторожа; заморозка любым ->
+    keeper не шлёт ничего, страж клиента не подписывает; снимок, сбор с ноги, забирание доли — сторож судит их записи Core."""
+    chain, core, inv, inv2, vault, cfg, clk, st = (w.chain, w.core, w.inv, w.inv2, w.vault, w.cfg, w.clk, w.st)
+    step, W = w.step, w.W
+    anyone = Account.create().address; chain.rpc("anvil_setBalance", anyone, hex(10 ** 20))
+
+    def as_(frm, sig, args, gas=5_000_000):
+        KS.chain_time(chain, clk); chain.rpc("anvil_impersonateAccount", frm)
+        rc = chain.receipt(chain.rpc("eth_sendTransaction", {"from": frm, "to": vault, "data": ABI.encode_call(sig, args),
+                                                             "gas": hex(gas)}))
+        if int(rc["status"], 16) != 1:
+            raise ValueError(f"стенд: {sig} от {frm} отклонён")
+        return rc
+
+    def view(sig, args, out, frm=None):
+        q = {"to": vault, "data": ABI.encode_call(sig, args)}
+        if frm:
+            q["from"] = frm
+        return ABI.decode(out, ABI.hexbytes(chain.rpc("eth_call", q, "latest")))
+
+    def signed(purpose):
+        j = RPC.NonceJournal(w.jpath)
+        return [v_ for op in j.ops.values() if op["planned"]["purpose"] == purpose for v_ in op["signed"]]
+
+    def kinds(rep):
+        return sorted({(f["w"], f["sev"]) for f in rep["findings"]})
+    w.keeper_(); k = st["k"]
+    chain.rpc("evm_setBlockGasLimit", hex(30_000_000)); chain.rpc("evm_mine")
+    em0 = k.client.emergency(); ed = VW.edition_of(chain.rpc("eth_getCode", vault, "latest"))
+    chk("FN-A0: финальная редакция по КОДУ: keeper — модуль аварии есть (не заморожен, объявления нет), запаса газа "
+        "заявок нет (контракт откатывает нехватку сам); сторож — все группы событий",
+        em0 is not None and em0["state"] == 0 and not em0["announced"]
+        and k.client.withdraw_gas_reserve([{"all": True}, {"all": False}]) == 0
+        and all(ed[g] for g in ("cover", "orders", "monday")), f"{em0} {ed}")
+    # --- FN-A1: честный поток --- #
+    clk["t"] += 10; core.send(inv, vault, 300); step(6)
+    clk["t"] += 10; core.send(inv2, vault, 100); step(6)                 # второй держатель — ему достанется доля в аварии
+    cl1 = "0x" + "1" * 32; clk["t"] += 10
+    W.write("size", clk["t"], copy_id="c1", coin="BTC", side=1, notional_micro=100 * MICRO, leg_seq=0, cloid=cl1)
+    step(); core.trade(w.legs[0], "BTC", "B", "0.002", "50000", "0.05", cl1); step(2)
+    W.write("entry_done", clk["t"] + 1, copy_id="c1", leg_seq=0, sized_qty="0.002", filled_qty="0.002", reason="filled")
+    step(); core.px["BTC"] = Decimal(50400); core.sync_perp(); step(2)
+    cl2 = "0x" + "2" * 32; clk["t"] += 10
+    W.write("exit_bind", clk["t"], cloid=cl2, parent_cloid=None, copies=[{"copy_id": "c1", "qty": "0.002"}])
+    core.trade(w.legs[0], "BTC", "A", "0.002", "52000", "0.052", cl2); step(3)
+    T = int(datetime(2027, 1, 18, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    clk["t"] = T - 120_000; step(); clk["t"] = T + 30 * 60_000; step(6)
+    rep = w.watch("fn1", later=cfg["watch"]["monday_sla_ms"])
+    chk("FN-A1: честный поток (депозит -> раздача -> вход/марк/закрытие -> понедельник) на финальной редакции: сторож "
+        "по событиям зелен, keeper не встал", rep["findings"] == [] and rep["w6"]["judged"] and not k.money_blocked(),
+        f"{kinds(rep)} {rep['findings'][:2]}")
+    # --- FN-A2: «вывести всё» обычным газом (оценка находит достаточный — нехватка откатывает IntentStarved) --- #
+    n0 = len(signed("processWithdrawals")); before = core.bal(inv)
+    w.request_withdraw(inv, 0, all_=True); step(18)
+    sg = signed("processWithdrawals")[n0:]; paid = [p_ for p_ in k.payouts.values() if p_["addr"] == inv.lower()]
+    chk("FN-A2: «вывести всё» — одна processWithdrawals с газом оценки (без запаса), nextIntent сдвинут, выплачено; "
+        "газ транзакции назван (малый блок HyperEVM — 3 000 000)", len(sg) == 1 and view("nextIntent()", [], ["uint256"])[0]
+        == 1 and paid and paid[-1]["status"] == "verified" and core.bal(inv) > before and not k.money_blocked(),
+        f"газ {[x['gas'] for x in sg]} {paid[-1:]} {k.money_blocked()}")
+    # --- FN-A3: объявление аварии admin'ом (вид 7) --- #
+    as_(chain.me, "proposeEmergency()", [])
+    clk["t"] += 10; core.send(inv2, vault, 40); n_tx = w.txs(); step(3)
+    em1 = k.client.emergency(); r3 = w.watch("fn3")
+    chk("FN-A3: объявление аварии (вид 7, хеш модуля) висит — keeper встал (депозит не зачислен, транзакций нет), "
+        "сторож: WR:emergency_announced — СТОП", em1["announced"] and "объявлена авария" in (k.halt or "")
+        and w.txs() == n_tx and any(f["key"].startswith("WR:emergency_announced") and f["sev"] == VW.SEV_HALT
+                                    for f in r3["findings"]) and r3["halt_present"],
+        f"{em1} {k.halt} {kinds(r3)}")
+    os.remove(cfg["pool"]["halt_file"])
+    # --- FN-A4: заморозка любым вызывающим (триггер 6 — созревшее объявление) --- #
+    trig = view("emergencyTrigger()", [], ["uint8"])[0]
+    as_(anyone, "emergencyFreeze()", [], gas=20_000_000)
+    n_tx = w.txs(); reps = [None] * 3
+    for i_ in range(3):
+        clk["t"] += 1_000; KS.chain_time(chain, clk); W.hb(clk["t"]); reps[i_] = k.step(); clk["t"] += 1
+        core.apply_actions()
+    em2 = k.client.emergency()
+    cap = json.load(open(cfg["pool"]["trading_legs"][0]["capital"], encoding="utf-8"))
+    chk("FN-A4: заморожено (emergencyFreeze любым, триггер 6): keeper за 3 шага не послал ни одной транзакции, отчёт "
+        "шага frozen, артефакт капитала закрывает входы бота (block frozen, deployable 0)",
+        trig == 6 and em2["state"] == 1 and em2["why"] == 6 and w.txs() == n_tx
+        and all(r_.get("frozen", {}).get("why") == 6 for r_ in reps) and cap["block"]["reason"] == "frozen"
+        and cap["deployable_usd"] == 0, f"trig {trig} {em2} tx {w.txs() - n_tx} {cap['block']}")
+    try:
+        k.client.execute("guard:1", "creditDeposit", [inv2, 40 * MICRO, b"\x07" * 32]); guarded = False
+    except VK.KeeperHalt as e:
+        guarded = "заморожен" in str(e)
+    sim = k.client.simulate("creditDeposit", [inv2, 40 * MICRO, b"\x07" * 32])
+    chk("FN-A5: страж клиента после заморозки: creditDeposit не подписан (KeeperHalt до журнала nonce); сам контракт "
+        "отверг бы его Frozen", guarded and w.txs() == n_tx and sim is not None and sim["name"] == "Frozen",
+        f"{guarded} {sim}")
+    # --- FN-A6: раздача правилом E — снимок, сбор с ноги, забирание доли (любой вызывающий) --- #
+    for _ in range(20):
+        left = view("emergencySnapStep(uint256)", [50], ["uint256"], frm=anyone)[0]
+        as_(anyone, "emergencySnapStep(uint256)", [50], gas=20_000_000)
+        if left == 0:
+            break
+    as_(anyone, "emergencyCollect(uint256)", [0], gas=20_000_000); core.apply_actions()
+    as_(anyone, "emergencyCollect(uint256)", [0], gas=20_000_000); core.apply_actions()       # perp -> spot -> хранилище
+    m_cum, due, paid0 = view("emergencyStatus(address)", [inv2], ["uint256"] * 3)
+    b2 = core.bal(inv2)
+    if due:
+        as_(anyone, "emergencyClaim(address)", [inv2], gas=20_000_000); core.apply_actions()
+    r6 = w.watch("fn6", later=VC.watch_slas(cfg)["core_confirm_sla_ms"])
+    w2 = [f for f in r6["findings"] if f["w"] == "W2"]
+    chk("FN-A6: снимок, сбор с ноги (EmergencyCollected) и забирание доли (EmergencyPaid) — сторож: стоп WR:frozen "
+        "(объявление им поглощено); Send, пришедший при объявлении, — тревога «возврат только через U_s»; записи Core "
+        "сбора и выплаты сведены (W3b/W4/W5 молчат); тождества бухгалтерии сняты, касса судится",
+        sorted(f["key"].split(":")[1] for f in r6["findings"] if f["w"] != "W2") == ["frozen"]
+        and len(w2) == 1 and w2[0]["sev"] == VW.SEV_ALERT and "U_s" in w2[0]["what"] and r6["w6"]["judged"] is False
+        and r6["w6"]["fold_wei"] == r6["w6"]["vault_wei"] and (due == 0 or core.bal(inv2) - b2 == due * 100),
+        f"M {m_cum} due {due} paid {paid0} got {core.bal(inv2) - b2} {kinds(r6)} {[f['key'][:40] for f in r6['findings']]}")
+
+
+def section_review(w, chk, Account):
+    """Требования враждебного ревью 20.10 к keeper'у и сторожу на НАСТОЯЩЕМ контракте пакета A или B: расчёт пачками под
+    лимит блока (атомарный не помещается), очередь против срока В7′ (пакет B: T_QUEUE_MAX с цепи, тревога сторожа и
+    требование бота в артефакте капитала), poolSink (Send с системного адреса — только вручную), PositionReduced (пакет A —
+    сторож сводит частичное закрытие, пакет B — события нет, свёртка расходится)."""
+    chain, core, inv, inv2, vault, cfg, clk, st = (w.chain, w.core, w.inv, w.inv2, w.vault, w.cfg, w.clk, w.st)
+    step, W = w.step, w.W
+    pkg_b = "t_queue_max" in w.ed["terms"]
+
+    def signed(purpose):
+        j = RPC.NonceJournal(w.jpath)
+        return [v_ for op in j.ops.values() if op["planned"]["purpose"] == purpose for v_ in op["signed"]]
+
+    def kinds(rep):
+        return sorted({(f["w"], f["sev"]) for f in rep["findings"]})
+    w.keeper_(); k = st["k"]
+    # 10 держателей (предел адресов стенда) с ордером каждый в своём поколении: атомарный расчёт ~ строки × поколения, а
+    # открытие пачками — постоянная (замер стенда: mondayBegin 0.49 млн, атомарный при 6×6 — 0.45 млн, то есть ДЕШЕВЛЕ)
+    holders = [inv, inv2] + [Account.create().address for _ in range(8)]
+    for a in holders[2:]:
+        core.activate(a); core.set_bal(a, 1_000 * 10 ** 8)
+    # пул, где атомарный расчёт тяжелее открытия пачками: депозит и ордер по очереди — открытые ордера в РАЗНЫХ поколениях
+    # (строка держателя в расчёте обходит поколения; замер ревью: при G = 60 атомарный 4.24 млн)
+    for j_, (i_, a) in enumerate((i_, a) for r_ in range(2) for i_, a in enumerate(holders)):   # два круга: 20 поколений
+        clk["t"] += 10; core.send(a, vault, 50 + 10 * i_); step(5)
+        cl = "0x" + f"{0x50 + j_:02x}" * 16; clk["t"] += 10
+        W.write("size", clk["t"], copy_id=f"g{j_}", coin="BTC", side=1, notional_micro=10 * MICRO, leg_seq=0, cloid=cl)
+        step(); core.trade(w.legs[0], "BTC", "B", "0.0002", "50000", "0.005", cl); step(2)
+        W.write("entry_done", clk["t"] + 1, copy_id=f"g{j_}", leg_seq=0, sized_qty="0.0002", filled_qty="0.0002",
+                reason="filled"); step(2)
+    core.px["BTC"] = Decimal(49000); core.sync_perp(); step(3)
+    # --- RW-A1: расчёт пачками — лимит блока чуть ниже оценки атомарного monday() --- #
+    T = int(datetime(2027, 1, 18, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    clk["t"] = T - 120_000; step()
+    gas_of = lambda sig: int(chain.rpc("eth_estimateGas", {"from": w.acct.address, "to": vault,
+                                                            "data": ABI.encode_call(sig, [])}), 16)
+    est = gas_of("monday()")
+    try:
+        est_b = gas_of("mondayBegin()")
+    except Exception as e_:                        # до пакета G2 открытия может не держаться — пакет его ставит
+        if type(e_).__name__ != "RpcError":
+            raise
+        est_b = f"откат оценки до пакета ({str(e_)[:60]})"
+    lim = -(-est * 64 // 63) - 1
+    # лимит блока keeper'а — ниже оценки атомарного расчёта. Лимит самой цепи не трогается: eth_call anvil берёт газ по
+    # лимиту блока, и тяжёлая витрина `dump()` откатилась бы от нехватки газа (на HyperEVM у eth_call свой потолок)
+    orig_room = RPC.TxManager.gas_room
+    RPC.TxManager.gas_room = lambda self_, to, data: (orig_room(self_, to, data)[0], lim)
+    try:
+        clk["t"] = T + 30 * 60_000; step(12)
+    finally:
+        RPC.TxManager.gas_room = orig_room
+    steps = [o for o in k.ops.values() if o["call"] in ("monday", "mondayBegin", "mondayStep", "mondayEnd")]
+    s_ = k.client.status()
+    incs = [json.loads(l)["what"] for l in open(k.inc_path, encoding="utf-8")] if os.path.exists(k.inc_path) else []
+    chk(f"RW-A1: атомарный monday() не помещается (оценка {est}, лимит блока {lim}; mondayBegin — {est_b}) — keeper сам "
+        f"выбрал расчёт пачками: "
+        f"mondayBegin -> mondayStep(k по оценке) -> mondayEnd; неделя 1, расчёт закрыт, каждая транзакция в лимите",
+        [o["call"] for o in steps][0] == "mondayBegin" and [o["call"] for o in steps][-1] == "mondayEnd"
+        and not [o for o in steps if o["call"] == "monday"] and s_[1] == 1 and s_[11] == 0
+        and all(v_["gas"] <= lim for p_ in ("mondayBegin", "mondayStep", "mondayEnd") for v_ in signed(p_))
+        and "op_needs_big_block" not in incs and not k.money_blocked(),
+        f"{[(o['call'], o['args']) for o in steps]} gas {[(p_, [v_['gas'] for v_ in signed(p_)]) for p_ in ('mondayBegin', 'mondayStep', 'mondayEnd')]} {k.money_blocked()}")
+    rep = w.watch("rw1", later=cfg["watch"]["monday_sla_ms"])
+    chk("RW-A1b: после расчёта пачками сторож зелен (MondaySettled — событием mondayEnd)", rep["findings"] == [],
+        f"{kinds(rep)} {rep['findings'][:2]}")
+    # --- RW-A2: очередь против срока В7′ --- #
+    qc = k.client.queue_clock()
+    if not pkg_b:
+        chk("RW-A2: пакет A — у модуля срока очереди нет (T_QUEUE_MAX откатывается), keeper очередь не судит",
+            qc is None, f"{qc}")
+    else:
+        core.silent_reject = True                                   # приход с ноги не дойдёт: очередь постоит
+        w.request_withdraw(inv, 0, all_=True); n0 = 0
+        for _ in range(10):
+            step()
+            if k.client.dump()["queue"]:
+                break
+        qc = k.client.queue_clock(); q_ = k.client.dump()["queue"]
+        if qc["oldest_ms"] is None:
+            raise ValueError(f"стенд: заявка в очередь бухгалтерии не легла ({qc}, стоп {k.money_blocked()})")
+        warn_at = qc["oldest_ms"] + qc["t_max_ms"] - k.queue_reserve
+        clk["t"] = warn_at + 5_000; KS.chain_time(chain, clk)
+        r0 = w.watch("rw2")
+        W.hb(clk["t"]); k.step(); clk["t"] += 1
+        cap = json.load(open(cfg["pool"]["trading_legs"][0]["capital"], encoding="utf-8"))
+        incs = [json.loads(l) for l in open(k.inc_path, encoding="utf-8")]
+        aging = [i_ for i_ in incs if i_["what"] == "queue_aging"]
+        need = aging[-1]["need_micro"] if aging else None
+        pair = ("release_usd" in cap, "release_by_ms" in cap)
+        chk("RW-A2: пакет B — T_QUEUE_MAX с цепи (двое суток), заявка «всё» легла в очередь, приход с ноги не дошёл; за "
+            "запас до срока: инцидент queue_aging (очередь, свободное, недостача), пара бота в артефакте ровно когда "
+            "недостача > 0 (иначе keeper выведет сам), сторож — тревога WQ",
+            qc["t_max_ms"] == 2 * 24 * 3600 * 1000 and q_ and aging and pair in ((True, True), (False, False))
+            and pair[0] == (need > 0) and any(f["w"] == "WQ" and f["sev"] == VW.SEV_ALERT for f in r0["findings"]),
+            f"{qc} queue {q_} need {need} pair {cap.get('release_usd')} {cap.get('release_by_ms')} {kinds(r0)}")
+        core.silent_reject = False
+    # --- RW-A3: poolSink — Send с системного адреса токена --- #
+    sys_ = "0x2000000000000000000000000000000000000001"; core.activate(sys_); core.set_bal(sys_, 10 ** 10)
+    n_ref = len(signed("refundDeposit")); clk["t"] += 10; core.send(sys_, vault, 30); step(3)
+    d_ = [d for d in k.decisions.values() if d.get("sender") == sys_]
+    sim = k.client.simulate("refundDeposit", [sys_, 30 * 10 ** 8, b"\x09" * 32, 7])
+    chk("RW-A3: Send с системного адреса токена — keeper: ручной возврат, ни зачисления, ни refundDeposit; контракт "
+        + ("пакета B такой возврат отвергает (BadRecipient)" if pkg_b else "пакета A его бы пропустил — keeper не пытается"),
+        d_ and d_[0]["kind"] == "refund_manual" and len(signed("refundDeposit")) == n_ref
+        and ((sim is not None and sim["name"] == "BadRecipient") if pkg_b else True), f"{d_[:1]} {sim}")
+    # --- RW-A4: частичное закрытие ключом keeper'а (keeper его не зовёт) — сторож по событию --- #
+    st["k"].close(); st["tx"].close(); st.clear()
+    cl1 = "0x" + "4" * 32; clk["t"] += 10
+    W.write("size", clk["t"], copy_id="r1", coin="BTC", side=1, notional_micro=100 * MICRO, leg_seq=0, cloid=cl1)
+    w.keeper_(); step(); core.trade(w.legs[0], "BTC", "B", "0.002", "50000", "0.05", cl1); step(3)
+    pid = VW.pid_of(w.legs[0], "r1", 0, 0); st["k"].close(); st["tx"].close(); st.clear()
+    K = w.acct.address; chain.rpc("anvil_impersonateAccount", K); KS.chain_time(chain, clk)
+    rc = chain.receipt(chain.rpc("eth_sendTransaction", {"from": K, "to": vault, "data": ABI.encode_call(
+        "reducePosition(bytes32,int256,uint256,int256)", [ABI.hexbytes(pid), 0, 50 * MICRO, -25_000]),
+        "gas": hex(5_000_000)}))
+    r4 = w.watch("rw4", later=VC.watch_slas(cfg)["w9_sla_ms"])
+    keys = [f["key"].split(":")[0] + ":" + f["key"].split(":")[1] for f in r4["findings"] if f["w"] in ("W7", "W9")]
+    chk("RW-A4: reducePosition ключом keeper'а (часть 0, нотионал и марк остатка) — "
+        + ("пакет A: PositionReduced, свёртка сходится — W7/W9 молчат" if not pkg_b else
+           "пакет B: события нет — свёртка ордера расходится со снимком, W9:fold (стоп)"),
+        int(rc["status"], 16) == 1 and ((not keys) if not pkg_b else ("W9:fold" in keys)), f"{keys} {kinds(r4)}")
+
+
+def section_rev95(w, chk, Account):
+    """Ред. 9.5 на НАСТОЯЩЕМ контракте (maxGens = 4): чтение без растущего dump() (dumpState + постраничная история в кэше
+    keeper'а и сторожа), внеочередной расчёт monday(false) перед ордером на ⌊maxGens/2⌋ (неделя не сдвигается,
+    MondaySettled той же недели — сторож зелен), предел: под KEEPER_HALT ордер сверх предела отвергнут контрактом —
+    keeper ждёт с инцидентом, сторож — стоп WG; стоп снят — расчёт и тот же ордер."""
+    chain, core, inv, vault, cfg, clk, st = w.chain, w.core, w.inv, w.vault, w.cfg, w.clk, w.st
+    step, W = w.step, w.W
+    reads = []; orig_view = VK.EvmVaultClient._view
+
+    def spy(self_, to, sig, args, block="latest"):
+        reads.append(sig); return orig_view(self_, to, sig, args, block)
+
+    def signed(purpose):
+        j = RPC.NonceJournal(w.jpath)
+        return [v_ for op in j.ops.values() if op["planned"]["purpose"] == purpose for v_ in op["signed"]]
+
+    def call(to, sig, out, args=()):
+        return ABI.decode(out, ABI.hexbytes(chain.rpc("eth_call", {"to": to, "data": ABI.encode_call(sig, list(args))},
+                                                      "latest")))
+    led = call(vault, "ledger()", ["address"])[0]
+    gl = lambda: tuple(call(led, "genLimits()", ["uint256"] * 3))
+    week = lambda: ABI.dec_fixed(ABI.hexbytes(chain.rpc("eth_call", {"to": led, "data": ABI.encode_call(
+        "status()", [])}, "latest")), 13)[1]
+    n_ord = [0]
+
+    def order():
+        """Депозит (веса меняются — новое поколение) -> решение бота -> финал входа без исполнения (cancelOrder)."""
+        i = n_ord[0]; n_ord[0] += 1
+        clk["t"] += 10; core.send(inv, vault, 20 + i); step(5)
+        cl = "0x" + f"{0x70 + i:02x}" * 16; clk["t"] += 10
+        W.write("size", clk["t"], copy_id=f"x{i}", coin="BTC", side=1, notional_micro=10 * MICRO, leg_seq=0, cloid=cl)
+        step(2)
+        W.write("entry_done", clk["t"] + 1, copy_id=f"x{i}", leg_seq=0, sized_qty="0.0002", filled_qty="0", reason="miss")
+        step(2)
+        return VW.pid_of(w.legs[0], f"x{i}", 0, 0)
+    def order_filled(px):
+        """Решение -> исполненный вход -> марк вниз: следующий ордер видит другой вес (поколение новое)."""
+        i = n_ord[0]; n_ord[0] += 1
+        cl = "0x" + f"{0x70 + i:02x}" * 16; clk["t"] += 10
+        W.write("size", clk["t"], copy_id=f"x{i}", coin="BTC", side=1, notional_micro=10 * MICRO, leg_seq=0, cloid=cl)
+        step(); core.px["BTC"] = px; core.sync_perp(); core.trade(w.legs[0], "BTC", "B", "0.0002", str(px), "0.005", cl)
+        step(2)
+        W.write("entry_done", clk["t"] + 1, copy_id=f"x{i}", leg_seq=0, sized_qty="0.0002", filled_qty="0.0002",
+                reason="filled")
+        step(2); core.px["BTC"] = px - 200; core.sync_perp(); step(2)
+        return VW.pid_of(w.legs[0], f"x{i}", 0, 0)
+    VK.EvmVaultClient._view = spy
+    try:
+        w.keeper_(); k = st["k"]
+        clk["t"] += 10; core.send(inv, vault, 300); step(6)
+        chk("R95-A0: редакция по коду — monday(bool) у хранилища, витрины истории у бухгалтерии; предел с цепи = 4",
+            k.client.supports("mondayX") and k.client.history_views() and gl()[0] == 4, f"{gl()}")
+        w0 = week(); order(); order()
+        g2 = gl(); x0 = len(signed("mondayX")); order()
+        g3 = gl()
+        ev = [a_ for a_, _ in w.events("MondaySettled(uint256)", [False])]
+        chk("R95-A1: gensSince = 2 = ⌊4/2⌋ — перед ордером внеочередной monday(false) (одна транзакция), неделя "
+            "бухгалтерии та же, MondaySettled той же недели; ордер встал в новое поколение (gensSince 1)",
+            g2[1] == 2 and x0 == 0 and len(signed("mondayX")) == 1 and week() == w0 and ev == [[w0]] and g3[1] == 1
+            and not k.money_blocked(), f"{g2} -> {g3} week {w0}->{week()} ev {ev} {k.money_blocked()}")
+        hist = json.load(open(os.path.join(cfg["keeper"]["data_dir"], "ledger_history.json"), encoding="utf-8"))
+        tot_refs = call(led, "ledgerRefs(uint256,uint256)", ["uint256"], (0, 0))[0]
+        chk("R95-A2: keeper читает dumpState() и историю постранично — dump() не звался ни разу; кэш истории keeper'а = "
+            "списку цепи (записи леджера)", "dump()" not in reads and VK.DUMP.STATE_SIG in reads
+            and len(hist["ledger_refs"]) == tot_refs > 0,
+            f"dump {reads.count('dump()')} refs {len(hist['ledger_refs'])}/{tot_refs}")
+        r1 = w.watch("w95a", later=VC.watch_slas(cfg)["w9_sla_ms"])
+        chk("R95-A3: сторож на этой цепи зелен — внеочередной MondaySettled той же недели не нарушение, история из своего "
+            "кэша (dumpState)", r1["findings"] == [] and os.path.exists(os.path.join(w.work, "w95a",
+                                                                                     "ledger_history.json")),
+            f"{sorted({(f['w'], f['sev'], f['key'][:40]) for f in r1['findings']})}")
+        # предел: под стопом расчёта нет — ордера до 4, пятый отвергнут контрактом
+        hf = cfg["pool"]["halt_file"]; os.makedirs(os.path.dirname(hf), exist_ok=True)
+        open(hf, "w").write("{}")
+        for j_ in range(5):                       # первый — в текущее поколение (веса те же), далее по новому
+            # под стопом зачислений нет — веса двигает бумажный убыток открытой позиции (марк вниз перед ордером)
+            last = order_filled(Decimal(50_000 - 500 * j_))
+        g4 = gl(); inc = [json.loads(l)["what"] for l in open(k.inc_path, encoding="utf-8")]
+        chk("R95-A4: под KEEPER_HALT внеочередного расчёта нет; на gensSince = 4 ордер отвергнут контрактом "
+            "(size_order: max_gens) — keeper ждёт с инцидентом size_order_max_gens, шаг жив",
+            g4[1] == 4 and "size_order_max_gens" in inc and "extra_settle_blocked" in inc and not k._poisoned
+            and len(signed("mondayX")) == 1, f"{g4} {inc[-5:]}")
+        os.remove(hf)
+        r2 = w.watch("w95b", later=VC.watch_slas(cfg)["w9_sla_ms"])
+        got = [f for f in r2["findings"] if f["key"] == f"WG:size_blocked:{last}"]
+        chk("R95-A5: сторож — ордер бота отвергнут пределом (симуляция sizeOrder от keeper'а на цепи) — стоп WG, "
+            "KEEPER_HALT записан", got and got[0]["sev"] == VW.SEV_HALT and r2["halt_present"],
+            f"{sorted({(f['w'], f['sev']) for f in r2['findings']})}")
+        os.remove(hf); step(6)
+        g5 = gl()
+        chk("R95-A6: стоп снят — внеочередной расчёт, ждавший ордер записан (gensSince 1), неделя та же",
+            len(signed("mondayX")) == 2 and g5[1] == 1 and week() == w0 and not k.money_blocked(),
+            f"{g5} {k.money_blocked()}")
+        # ЗАМЕР для каденса mainnet (шаблон config/vault_pool.mainnet.json): вызовы RPC и вес HL одного шага keeper'а
+        # без событий; печатается, порога нет — число идёт в вывод каденса
+        n_rpc = [0]; hl = []; orig_req = RPC.EvmRpc.request; orig_post = KS.Core.post
+        H = VK.MODLOAD.load("hl_http", os.path.join(VK.HERE, "hl_http.pytxt"))
+
+        def req(self_, method, *params):
+            n_rpc[0] += 1; return orig_req(self_, method, *params)
+
+        def post(self_, payload, weight=None, lane=None):
+            hl.append((payload["type"], weight if weight is not None else H.info_weight(payload)))
+            return orig_post(self_, payload, weight=weight, lane=lane)
+        KS.Core.post = post; w.restart(); step(2)          # keeper держит связанный метод — пересобрать с замером
+        RPC.EvmRpc.request = req; hl.clear()
+        try:
+            step(3)
+        finally:
+            RPC.EvmRpc.request = orig_req; KS.Core.post = orig_post
+        print(f"  R95-M: шаг keeper'а без событий (одна нога в конфиге стенда): RPC {n_rpc[0] / 3:.1f} вызовов, "
+              f"HL {sum(w_ for _, w_ in hl) / 3:.0f} веса — {sorted(set(t for t, _ in hl))}")
+    finally:
+        VK.EvmVaultClient._view = orig_view
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not (a[:1] == ["run"] and len(a) <= 2 and (len(a) == 1 or a[1] in EDITIONS)):
+        raise SystemExit(f"usage: python contracts/diff/vault_rev9_stand.pytxt run [{'|'.join(EDITIONS)}]")
+    sys.exit(run(*a[1:]))

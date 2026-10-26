@@ -1,0 +1,2835 @@
+# -*- coding: utf-8 -*-
+"""pool_ledger_diff — дифференциал контракта `PoolLedger` с эталоном `runtime/vault_accounting.pytxt`.
+
+Поднимает `anvil` (С лимитом EIP-170 — реализации обязаны в него помещаться), деплоит контракт и проигрывает каждую
+фикстуру `tests/fixtures/vault_accounting/*.json` вызов за вызовом (все сценарии ред. 9.1 — фикстуры эталона, своих
+сценариев у дифференциала нет). На каждом шаге судится:
+  1. ПРИНЯТ ли вызов — так же, как в эталоне (отказ эталона = revert контракта);
+  2. СОСТОЯНИЕ после вызова — всё, число в число (допуск 0), после нормализации «отсутствующий счёт = 0»;
+  3. ВИТРИНЫ действующего адреса, если фикстура их несёт (`investor_view`, `referrer_view`).
+Первое расхождение печатается с именем поля, обоими значениями и номером вызова; rc != 0.
+
+ABI-кодек — общий владелец `runtime/evm_abi.pytxt` (вынесен отсюда 2026-10-18; селфтест C1 ниже сверяет ЕГО с
+`cast abi-encode`). Селекторы берутся из `methodIdentifiers` артефакта forge, а не считаются здесь.
+
+Запуск:  python contracts/diff/pool_ledger_diff.pytxt run [--only scenario_200] [--verbose] [--paged | --paged-k K] [--fuzz N] [--jobs 8]
+         python contracts/diff/pool_ledger_diff.pytxt mutants [--all] [--only <подстрока>] [--start <подстрока>] [--fuzz N]
+         python contracts/diff/pool_ledger_diff.pytxt mutants --vault [--all] [--only <подстрока>] [--start <подстрока>]
+         python contracts/diff/pool_ledger_diff.pytxt rehearse-deploy [--out manifest.json]
+         python contracts/diff/pool_ledger_diff.pytxt postdeploy --rpc <url> --manifest <file> [--spacing 1.0]
+         python contracts/diff/pool_ledger_diff.pytxt selftest
+`--paged` — недельный расчёт пачками по одной единице каждого этапа (`mondayStep(1)` до конца, затем `mondayEnd`),
+`--paged-k K` — по K единиц; `--fuzz N` — ещё N сценариев эталона с длинной очередью заявок (`queue_calls`).
+`mutants --vault` — саботаж хранилища `PoolVault.sol` (словарь `VAULT_MUTANTS`, судья — forge-стенды `PoolVaultTest`);
+раннер мутантов хранилища ОДИН — новые мутанты хранилища добавляются в этот словарь, второй раннер не заводится.
+Foundry — каталог HL_FOUNDRY_BIN или PATH (резолвер владельца — `analysis/e96_vault_research_gate.tool`)."""
+from __future__ import annotations
+import argparse, glob, http.client, json, os, random, re, socket, subprocess, sys, threading, time
+from importlib.machinery import SourceFileLoader
+sys.stdout.reconfigure(encoding="utf-8")
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+CONTRACTS = os.path.join(ROOT, "contracts")
+ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedger.json")
+VIEWS_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedgerViews.json")
+MONDAY_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedgerMonday.json")
+PROJ_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedgerProj.json")
+EMERGENCY_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedgerEmergency.json")
+BOOK_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolLedger.sol", "PoolLedgerBook.json")       # ред. 9.5: книга ордеров
+VAULT_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolVault.sol", "PoolVault.json")
+LEG_ARTIFACT = os.path.join(CONTRACTS, "out", "TradingLeg.sol", "TradingLeg.json")
+VAULT_EM_ARTIFACT = os.path.join(CONTRACTS, "out", "PoolVaultEmergency.sol", "PoolVaultEmergency.json")
+# реализации бухгалтерии на ОДНОЙ памяти (PoolLedger исполняет их делегированным вызовом): раскладка обязана совпасть
+LEDGER_PARTS = ("PoolLedger", "PoolLedgerViews", "PoolLedgerMonday", "PoolLedgerProj", "PoolLedgerEmergency", "PoolLedgerBook")
+EIP170 = 24_576                # предел runtime-кода
+EIP3860 = 49_152               # предел initcode
+MANIFEST_SCHEMA = "pool_deploy_manifest_v1"
+POOL_CREDITOR = "0x" + "0" * 40      # ключ «долг перед пулом» в книге доплативших во внешнем виде (эталон POOL_CREDITOR)
+FIXTURES = os.path.join(ROOT, "tests", "fixtures", "vault_accounting")
+GAS = 1_000_000_000            # газ на вызов: проекции эталона обходят всех; газ судит этап 5, не дифференциал
+CHAIN_LOCK = threading.Lock()
+ABI = sys.modules.get("evm_abi") or SourceFileLoader("evm_abi", os.path.join(ROOT, "runtime", "evm_abi.pytxt")).load_module()
+# разбор `dump()` и нормальная форма эталона — владелец `runtime/pool_ledger_dump.pytxt` (2026-10-18: его зовёт и keeper)
+DUMP = sys.modules.get("pool_ledger_dump") or SourceFileLoader("pool_ledger_dump", os.path.join(ROOT, "runtime", "pool_ledger_dump.pytxt")).load_module()
+
+PATH = {"spot": 0, "evm": 1}
+FIXTURE_SCHEMA = "vault_accounting_fixture_v9"      # пакет безопасности: в `constants` минимум депозита и предел адресов,
+#                                                    в вызовах — `refund_deposit`; ред. 9: книга доплативших, операторов нет
+PARTNER = DUMP.PARTNER
+ORDER_STATE = DUMP.ORDER_STATE
+PAGED_MAX_STEPS = 50_000         # пачек одного расчёта: больше — расчёт не сходится (фикстурам нужно на порядки меньше)
+MS_DONE = 7                    # этап недельного расчёта «осталось mondayEnd» (`PoolLedgerBase.MS_DONE`)
+EM_READY = 2                   # ред. 9.4: `emergencyTotals()[0]` — снимок готов (0 — живой пул, 1 — идёт проход итогов)
+BPS = 10_000                   # доля ноги A в раздаче (`legShareBps`): 0..BPS, нога B — остаток
+CORE_USER_EXISTS = "0x" + "0" * 37 + "810"     # прекомпайл HyperCore `coreUserExists` (HLConstants)
+
+
+def foundry(name: str) -> str:
+    e96 = sys.modules.get("e96_gate") or SourceFileLoader(
+        "e96_gate", os.path.join(ROOT, "analysis", "e96_vault_research_gate.pytxt")).load_module()
+    return e96.tool(name)
+
+
+# --- ABI ------------------------------------------------------------------------------------------------------ #
+# Кодек — владелец `runtime/evm_abi.pytxt`, разбор `dump()`/страниц истории — владелец `runtime/pool_ledger_dump.pytxt`
+# (вынесены 2026-10-18 веткой keeper'а; слияние 2026-10-22 свело к ним и код ред. 9.5). Имена ниже — ССЫЛКИ на владельцев,
+# не копии: второго кодека и второго разбора раскладки в дереве нет (§I.9).
+U256 = ABI.U256
+encode, signed, dec_int_array, dec_fixed, addr_of = ABI.encode, ABI.signed, ABI.dec_int_array, ABI.dec_fixed, ABI.addr_of
+# слов на ордер в выгрузке финального контракта: (gen, state, notional, upnl, sized_week, partR) — ред. 9.3 частичное закрытие
+ORDER_WORDS = 6
+
+
+def parse_dump(w: list) -> dict:
+    """Разбор `dump()` / `dumpState()` в нормальную форму дифференциала (раскладка — `PoolLedgerViews._dumpHead/_dumpTail`)."""
+    return DUMP.parse(w, un_id32, order_words=ORDER_WORDS)
+
+
+def dec_page(data: bytes) -> tuple:
+    """`(uint256, bytes32[])` — страница истории (`closedPids`, `ledgerRefs`): (всего, [слова как int])."""
+    total, page = DUMP.decode_page(data)
+    return total, [int(x, 16) for x in page]
+
+
+def id32(s) -> bytes:
+    """`pid` / `ledger_ref` эталона (строка <= 32 байт UTF-8) -> bytes32; None -> нули (контракт отвергнет, как эталон)."""
+    if s is None:
+        return bytes(32)
+    b = s.encode("utf-8")
+    if not b or len(b) > 32:
+        raise ValueError(f"id32: {s!r}")
+    return b + bytes(32 - len(b))
+
+
+def un_id32(v: int) -> str:
+    return (v % ABI.U256).to_bytes(32, "big").rstrip(b"\x00").decode("utf-8")
+
+
+# --- anvil ---------------------------------------------------------------------------------------------------- #
+class Chain:
+    def __init__(self):
+        # порт выбирается и занимается anvil'ом под замком: иначе два потока одного прогона могли бы получить один порт
+        # и проиграть две фикстуры на одной цепи
+        with CHAIN_LOCK:
+            self._start()
+
+    def _start(self):
+        """Свой anvil, а не чужой: при занятом порте (гонка `bind(0)` -> закрыть -> `anvil --port P` с соседним процессом)
+        anvil молча выходит, а опрос порта отвечал бы ЧУЖОЙ цепью — прогон сел бы на неё. Поэтому у цепи уникальный
+        `--chain-id`, и она принята, только если процесс жив И `eth_chainId` равен своему; иначе — новый порт."""
+        for _attempt in range(5):
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0)); self.port = s.getsockname()[1]
+            self.chain_id = random.SystemRandom().randrange(1 << 20, 1 << 48)
+            # лимит размера кода НЕ снят: оба контракта обязаны в него помещаться (EIP-170), это часть проверки
+            self.proc = subprocess.Popen([foundry("anvil"), "--port", str(self.port), "--chain-id", str(self.chain_id),
+                                          "--disable-block-gas-limit", "--silent", "--accounts", "1"],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.url = f"http://127.0.0.1:{self.port}"
+            self.conn = None
+            for _ in range(100):
+                if self.proc.poll() is not None:
+                    break                                   # свой anvil вышел (порт занят) — отвечать может только чужой
+                try:
+                    cid = int(self.rpc("eth_chainId"), 16)
+                except OSError:
+                    time.sleep(0.1); continue
+                if cid != self.chain_id:
+                    break                                   # отвечает чужая цепь на том же порте
+                self.me = self.rpc("eth_accounts")[0]
+                self.nid = 0
+                return
+            else:
+                self.close(); raise ValueError("anvil не поднялся за 10 с")
+            self.close()
+        raise ValueError("anvil: 5 попыток подряд порт оказался занят чужой цепью")
+
+    def rpc(self, method, *params):
+        """Одно постоянное соединение на цепь (keep-alive): соединение на запрос при нескольких цепях сразу исчерпывает
+        эфемерные порты Windows (TIME_WAIT) — замер: WinError 10060 на восьми параллельных фикстурах."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)}).encode()
+        for attempt in (0, 1):
+            if self.conn is None:
+                self.conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=120)
+            try:
+                self.conn.request("POST", "/", body, {"Content-Type": "application/json"})
+                out = json.loads(self.conn.getresponse().read())
+                break
+            except (http.client.HTTPException, ConnectionError):
+                # anvil закрыл простаивающее соединение: один переподключённый повтор (запрос до него не дошёл)
+                self.conn.close(); self.conn = None
+                if attempt:
+                    raise
+        if "error" in out:
+            raise RpcError(out["error"])
+        return out["result"]
+
+    def receipt(self, h) -> dict:
+        """Квитанция появляется не в ответе на отправку, а когда anvil смайнит блок (замер: десятки мс)."""
+        for _ in range(600):
+            rc = self.rpc("eth_getTransactionReceipt", h)
+            if rc:
+                return rc
+            time.sleep(0.01)
+        raise ValueError(f"нет квитанции {h} за 6 с")
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+class RpcError(Exception):
+    pass
+
+
+class Ledger:
+    """Обёртка контракта: вызовы по именам эталона, ответ — «принят ли»."""
+    def __init__(self, chain: Chain, art: dict, constants: dict, paged: bool = False):
+        self.c = chain; self.paged = paged
+        # витрины живут в PoolLedgerViews и вызываются через fallback PoolLedger: селекторы — объединение двух артефактов
+        self.sel = dict(art["views"]["methodIdentifiers"]); self.sel.update(art["methodIdentifiers"])
+        impl = {name: deploy_code(chain, art[name]["bytecode"]["object"], f"реализации {name}")
+                for name in ("views", "monday", "proj", "emergency", "book")}
+        # владелец — ключ цепи: дифференциал судит бухгалтерию без хранилища (связность хранилища — `deploy_pool`)
+        self.addr = deploy_code(chain, art["bytecode"]["object"] + ledger_ctor(constants, impl["views"], impl["monday"],
+                                                                               impl["proj"], impl["emergency"], chain.me,
+                                                                               impl["book"]).hex(),
+                                "PoolLedger")
+        self.treasury = constants["treasury"].lower()
+        self.frozen = False; self.result = None       # ред. 9.4: пул заморожен; результат последнего вызова с `result`
+        for p in constants["partners"]:
+            self.must("initPartner(address)", ["address"], [p])
+        # ред. 9.5 (спека 8.15): предел поколений — аргумент конструктора (`ledger_ctor`, как у эталона `GenLedger(max_gens)`);
+        # ключ есть только у фикстуры 266, у прочих — 0, «правила нет». Поколений с последнего расчёта — по номеру поколения
+        # на последнем принятом расчёте (поколения нумеруются подряд, расчёт их не открывает)
+        self.max_gens = max_gens_of(constants); self.gen_at_settle = 0; self.settled = False
+
+    def data(self, sig, types, values) -> str:
+        if sig not in self.sel:
+            raise ValueError(f"у контракта нет {sig}")
+        return "0x" + self.sel[sig] + ABI.encode(types, values).hex()
+
+    def send(self, sig, types, values) -> bool:
+        h = self.c.rpc("eth_sendTransaction", {"from": self.c.me, "to": self.addr, "data": self.data(sig, types, values),
+                                               "gas": hex(GAS)})
+        return int(self.c.receipt(h)["status"], 16) == 1
+
+    def next_week(self):
+        """Ревью-3b: календарный расчёт контракта — не чаще одного за календарную неделю (`_calWeek` по `block.timestamp`); у
+        эталона времени нет, каждый его календарный расчёт — новая неделя. Поэтому перед КАЖДЫМ календарным расчётом цепь
+        сдвигается на 7 суток: номер недели следующего блока растёт ровно на единицу. Внеочередной расчёт время не двигает."""
+        self.c.rpc("evm_increaseTime", 7 * 86400)
+
+    def must(self, sig, types, values):
+        if not self.send(sig, types, values):
+            raise ValueError(f"{sig}{values}: служебный вызов отклонён")
+
+    def call(self, sig, types, values) -> bytes:
+        return bytes.fromhex(self.c.rpc("eth_call", {"from": self.c.me, "to": self.addr, "data": self.data(sig, types, values),
+                                                     "gas": hex(GAS)}, "latest")[2:])
+
+    def try_call(self, sig, types, values):
+        try:
+            return self.call(sig, types, values)
+        except RpcError:
+            return None
+
+    def apply(self, c) -> bool:
+        ok = self._apply(c)
+        if ok and c["call"] == "monday":
+            self.settled = True                         # ред. 9.5: номер поколения на расчёте — следующей выгрузкой
+        return ok
+
+    def _apply(self, c) -> bool:
+        k = c["call"]; i = lambda x: int(x)
+        if k == "deposit":
+            payout = 0 if c["payout"] is None else (2 if c["payout"] else 1)
+            return self.send("deposit(address,uint256,address,uint8,uint8,bytes32)",
+                             ["address", "uint256", "address", "uint8", "uint8", "bytes32"],
+                             [c["addr"], i(c["amount"]), c["referrer"] or "0x" + "0" * 40, payout, PATH[c["path"]],
+                              id32(c["ledger_ref"])])
+        if k == "withdraw":
+            return self.withdraw(c["addr"], i(c["amount"]), c["reward"])
+        if k == "size_order":
+            return self.send("sizeOrder(bytes32,uint256)", ["bytes32", "uint256"], [id32(c["pid"]), i(c["notional"])])
+        if k in ("fill_order", "cancel_order"):
+            return self.send({"fill_order": "fillOrder(bytes32)", "cancel_order": "cancelOrder(bytes32)"}[k], ["bytes32"], [id32(c["pid"])])
+        if k == "mark_position":
+            return self.send("markPosition(bytes32,int256)", ["bytes32", "int256"], [id32(c["pid"]), i(c["upnl"])])
+        if k == "close_position":
+            return self.send("closePosition(bytes32,int256)", ["bytes32", "int256"], [id32(c["pid"]), i(c["realized"])])
+        if k == "reduce_position":
+            return self.send("reducePosition(bytes32,int256,uint256,int256)", ["bytes32", "int256", "uint256", "int256"],
+                             [id32(c["pid"]), i(c["realized"]), i(c["notional"]), i(c["upnl"])])
+        if k == "monday" and c.get("calendar", True) is False and not self.paged:
+            # ред. 9.5 (спека 8.15): внеочередной расчёт — неделя не сдвигается; у контракта без него — громкий отказ `data`
+            return self.send("monday(bool)", ["bool"], [False])
+        if k == "monday" and self.paged:
+            return self.monday_paged(c.get("calendar", True) is not False)
+        if k == "monday":
+            self.next_week()                            # календарный атомарный: новая календарная неделя (ревью-3b)
+        if k in ("monday", "sweep_to_perp", "pay_queue", "treasury_payout"):
+            return self.send({"monday": "monday()", "sweep_to_perp": "sweepToPerp()", "pay_queue": "payQueue()",
+                              "treasury_payout": "treasuryPayout()"}[k], [], [])
+        if k == "claim":
+            return self.send("claim(address)", ["address"], [c["addr"]])
+        if k == "set_payout_mode":
+            return self.send("setPayoutMode(address,bool)", ["address", "bool"], [c["addr"], c["payout"]])
+        if k == "set_withdrawable":
+            return self.send("setWithdrawable(uint256)", ["uint256"], [i(c["amount"])])
+        if k == "set_partner":
+            return self.send("setPartner(address,uint8)", ["address", "uint8"], [c["addr"], PARTNER[c["status"]]])
+        if k == "cover_shortfall":
+            return self.send("coverShortfall(uint256,uint8,bytes32)", ["uint256", "uint8", "bytes32"],
+                             [i(c["amount"]), PATH[c["path"]], id32(c.get("ledger_ref"))])
+        if k == "refund_deposit":
+            return self.send("refundRef(bytes32)", ["bytes32"], [id32(c["ledger_ref"])])
+        if k == "emergency_freeze":
+            return self.freeze()
+        if k == "emergency_due":
+            m = i(c["m_cum"])
+            raw = None if m < 0 or m >= U256 else self.try_call("emergencyDue(address,uint256)", ["address", "uint256"],
+                                                                 [c["addr"], m])
+            self.result = None if raw is None else dec_fixed(raw, 1)[0]
+            return raw is not None
+        raise ValueError(f"вызов {k} дифференциалом не поддержан")
+
+    # коды исхода `withdraw` (`PoolLedgerBase.W_*`): бизнес-отказ эталона контракт возвращает КОДОМ, а не отказом транзакции
+    W_CODES = {0: "ok", 1: "withdraw: amount", 2: "uint128"}
+
+    def withdraw(self, addr: str, amount: int, reward: bool) -> bool:
+        """КОДЕК СТАТУСА `withdraw`: принят ли вызов — так же, как в эталоне. Бизнес-отказ эталона (`withdraw: …` — ноль или сверх
+        свободной доли, `_amount` — вне uint128) контракт отдаёт кодом при успешной транзакции; прочие отказы — отказ транзакции.
+        Код читается `eth_call` на том же состоянии, затем вызов отправляется: транзакция обязана пройти тогда и только тогда,
+        когда прошёл `eth_call` (иначе — расхождение, а не «принят»), а код вне известных — расхождение. Что отказ кодом
+        состояние не тронул, судит сравнение состояния после вызова (эталон отказа не меняет ничего)."""
+        args = (["address", "uint256", "bool"], [addr, amount, reward])
+        raw = self.try_call("withdraw(address,uint256,bool)", *args)
+        sent = self.send("withdraw(address,uint256,bool)", *args)
+        if (raw is not None) != sent:
+            raise ValueError(f"withdraw: eth_call {'прошёл' if raw is not None else 'отказал'}, а транзакция "
+                             f"{'прошла' if sent else 'отказала'} на том же состоянии")
+        if raw is None:
+            return False
+        code = dec_fixed(raw, 3)[0]
+        if code not in self.W_CODES:
+            raise ValueError(f"withdraw: код исхода {code} вне известных {self.W_CODES}")
+        return code == 0
+
+    def freeze(self) -> bool:
+        """Ред. 9.4: заморозка и проход итогов снимка пачками по `paged` держателей (атомарная форма — все сразу) до готовности;
+        эталон замораживает атомарно. Пачка, после которой проход не сдвинулся, — отказ (снимок не сходится, раздача заперта)."""
+        if not self.send("emergencyFreeze()", [], []):
+            return False
+        k = int(self.paged) or U256 - 1; prev = None
+        for _ in range(PAGED_MAX_STEPS):
+            tot = dec_fixed(self.call("emergencyTotals()", [], []), 9)
+            if tot[0] == EM_READY:
+                self.frozen = True
+                return True
+            if tot[2] == prev:
+                raise ValueError(f"emergencySnapStep({k}) не сдвинул проход итогов: пройдено {tot[2]}")
+            prev = tot[2]
+            if not self.send("emergencySnapStep(uint256)", ["uint256"], [k]):
+                raise ValueError(f"emergencySnapStep отклонён посреди прохода (пройдено {tot[2]}) — раздача заперта")
+        raise ValueError(f"emergencySnapStep: {PAGED_MAX_STEPS} пачек, а снимок не готов")
+
+    def progress(self) -> tuple:
+        """(этап, единиц этапа сделано, осталось, открыт ли расчёт) — `mondayProgress()`."""
+        w = ABI.dec_fixed(self.call("mondayProgress()", [], []), 4)
+        return w[0], w[1], w[2], bool(w[3])
+
+    def monday_paged(self, calendar: bool = True) -> bool:
+        """Тот же недельный расчёт пачками по `paged` единиц каждого этапа (по умолчанию ОДНОЙ: строка, реферальная доля,
+        работа возврата, (должник, поколение) раздела, строка таблицы «весь пул») — исход обязан совпасть с атомарным
+        эталоном. Пачка, после которой ход расчёта не сдвинулся, — отказ: шаги стоят на месте, а пул заперт открытым
+        расчётом."""
+        # ред. 9.5 (спека 8.15): внеочередной расчёт открывается `mondayBegin(false)` — неделя не сдвигается
+        if calendar:
+            self.next_week()                            # ревью-3b: календарный расчёт — новая календарная неделя
+        began = self.send("mondayBegin()", [], []) if calendar else self.send("mondayBegin(bool)", ["bool"], [False])
+        if not began:
+            return False
+        prev = None; steps = 0
+        while True:
+            cur = self.progress()
+            if cur[0] == MS_DONE:
+                break
+            steps += 1
+            if steps > PAGED_MAX_STEPS:
+                raise ValueError(f"mondayStep: {PAGED_MAX_STEPS} пачек, а расчёт не кончился (этап {cur[0]}) — шаги не сходятся")
+            if cur[:2] == prev:
+                raise ValueError(f"mondayStep({int(self.paged)}) не сдвинул расчёт: этап {cur[0]}, сделано {cur[1]}, осталось {cur[2]}")
+            prev = cur[:2]
+            if not self.send("mondayStep(uint256)", ["uint256"], [int(self.paged)]):
+                raise ValueError(f"mondayStep отклонён посреди открытого расчёта (этап {cur[0]}) — пул заперт")
+        if not self.send("mondayEnd()", [], []):
+            raise ValueError("mondayEnd отклонён — пул заперт в открытом расчёте")
+        return True
+
+    # --- состояние ---------------------------------------------------------------------------------------- #
+    def state(self) -> dict:
+        w = dec_int_array(self.call("dump()", [], []))
+        st = parse_dump(w)
+        self.history_views(st, w)
+        if self.frozen:                                 # ред. 9.4: ключ `emergency` — только у замороженного пула, как у эталона
+            e = dec_int_array(self.call("emergencyDump()", [], []))
+            z = dict(zip(("week", "F_T", "H", "E", "S", "P"), e[:6])); z["treasury"] = self.treasury
+            n = e[6]; z["planes"] = {addr_of(e[7 + 4 * j]): tuple(e[8 + 4 * j: 11 + 4 * j]) for j in range(n)}
+            if 7 + 4 * n != len(e) or len(z["planes"]) != n:
+                raise ValueError(f"emergencyDump: {len(e)} слов при {n} держателях — раскладка разошлась")
+            st["emergency"] = z
+        return st
+
+    def history_views(self, st: dict, w: list):
+        """Ревью-2, #1 / #3 — витрины keeper'а против выгрузки на КАЖДОМ шаге: `liveGenCount` = число поколений выгрузки;
+        `dumpState` = выгрузка без истории (та же раскладка, длины списков истории 0); `closedPids`/`ledgerRefs` —
+        страницы [0, s) + [s, ∞) склеиваются в список выгрузки, `from` за концом — пустая страница при той же длине;
+        `isClosedPid`/`isLedgerRef` — истина на последнем элементе списка, ложь на живом ордере и на ни разу не виданном id."""
+        g = dec_fixed(self.call("liveGenCount()", [], []), 1)[0]
+        if g != len(st["snaps"]):
+            raise ValueError(f"liveGenCount() = {g}, а поколений в выгрузке {len(st['snaps'])}")
+        # ред. 9.5: `genLimits()` — (предел, поколений с последнего расчёта, ЖИВЫХ); живое — текущее или с ордером sized/open.
+        # Список живых ведёт контракт (закрытие окончательного поколения в close/cancel/sizeOrder), выгрузка — эталон
+        if self.settled:
+            self.gen_at_settle = st["gen"]; self.settled = False
+        live = sum(1 for q in st["snaps"] if q == st["gen"] or any(o[0] == q and o[1] in (1, 2) for o in st["orders"].values()))
+        lim = tuple(dec_fixed(self.call("genLimits()", [], []), 3))
+        want = (self.max_gens, st["gen"] - self.gen_at_settle, live)
+        if lim != want:
+            raise ValueError(f"genLimits() = {lim}, а по выгрузке (предел, с расчёта, живых) {want}")
+        bare = parse_dump(dec_int_array(self.call("dumpState()", [], [])))
+        if bare["closed_pids"] or bare["ledger_refs"]:
+            raise ValueError("dumpState(): история не пуста")
+        want = dict(st, closed_pids=[], ledger_refs=[])
+        if bare != want:
+            bad = sorted(k for k in want if bare.get(k) != want[k])
+            raise ValueError(f"dumpState() расходится с dump() вне истории: {bad}")
+        for sig, key, member in (("closedPids(uint256,uint256)", "closed_pids", "isClosedPid(bytes32)"),
+                                 ("ledgerRefs(uint256,uint256)", "ledger_refs", "isLedgerRef(bytes32)")):
+            full = st[key]; cut = len(full) // 2
+            got = []
+            for lo, n in ((0, cut), (cut, U256 - 1)):
+                total, page = dec_page(self.call(sig, ["uint256", "uint256"], [lo, n]))
+                if total != len(full):
+                    raise ValueError(f"{sig}: всего {total}, а в выгрузке {len(full)}")
+                got += [un_id32(x) for x in page]
+            if got != full:
+                raise ValueError(f"{sig}: страницы {got[:4]}… не равны списку выгрузки {full[:4]}…")
+            total, page = dec_page(self.call(sig, ["uint256", "uint256"], [len(full) + 1, 5]))
+            if (total, page) != (len(full), []):
+                raise ValueError(f"{sig}: from за концом — ({total}, {len(page)} записей), а не пустая страница")
+            probes = [(full[-1], True)] if full else []
+            probes.append(("~never-used~", False))
+            if key == "closed_pids":
+                probes += [(pid, False) for pid, o in st["orders"].items() if o[1] != ORDER_STATE["closed"]][:1]
+            for x, want_in in probes:
+                if bool(dec_fixed(self.call(member, ["bytes32"], [id32(x)]), 1)[0]) != want_in:
+                    raise ValueError(f"{member}({x!r}) != {want_in}")
+
+
+    def views(self, addr) -> dict:
+        out = {"addr": addr}
+        raw = self.try_call("investorView(address)", ["address"], [addr])
+        # `isInvestor` (O(1), им хранилище решает «первый ли депозит») обязан совпасть с «витрина инвестора есть» эталона
+        is_inv = bool(dec_fixed(self.call("isInvestor(address)", ["address"], [addr]), 1)[0])
+        if is_inv != (raw is not None):
+            raise ValueError(f"isInvestor({addr}) = {is_inv}, а витрина инвестора {'есть' if raw is not None else 'отказала'}")
+        if raw is None:
+            out["investor"] = None
+        elif self.frozen:                               # ред. 9.4: вывода нет — витрина эталона показывает долю снимка
+            v = dec_fixed(raw, 3)
+            out["investor"] = {"deposited": v[0], "withdrawn": v[1], "value": v[2], "safe_now": 0, "emergency_planes":
+                               dec_fixed(self.call("emergencyPlanes(address)", ["address"], [addr]), 3)}
+        else:
+            v = ABI.dec_fixed(raw, 11)
+            names = ("deposited", "withdrawn", "value", "net_profit", "claimable", "claimable_now", "queued",
+                     "to_next_fee", "participation_bps", "payout_mode", "pool_shortfall")
+            inv = dict(zip(names, v)); inv["payout_mode"] = bool(inv["payout_mode"])
+            free = ABI.signed(self.call("freeStake(address,bool)", ["address", "bool"], [addr, False]))
+            if free:
+                paid = self.try_call("withdraw(address,uint256,bool)", ["address", "uint256", "bool"], [addr, free, False])
+                w = None if paid is None else dec_fixed(paid, 3)
+                if w is None or w[0] != 0:
+                    raise ValueError(f"safe_now: вывод свободных {free} на копии отклонён у {addr} (код {w and w[0]})")
+                inv["safe_now"] = w[1]
+            else:
+                inv["safe_now"] = 0
+            out["investor"] = inv
+        r = ABI.dec_fixed(self.call("referrerView(address)", ["address"], [addr]), 6)
+        out["referrer"] = dict(zip(("reward", "reward_queued", "reward_claimable", "reward_claimable_now",
+                                    "reward_withdrawn", "invited"), r))
+        return out
+
+
+# --- эталонное состояние в той же нормальной форме ---------------------------------------------------------- #
+def norm_ref(s: dict) -> dict:
+    """Нормальная форма эталона — владелец `pool_ledger_dump.norm_ref` (шесть слов ордера: `part_R`, снимок `emergency`)."""
+    return DUMP.norm_ref(s, order_words=ORDER_WORDS)
+
+
+def norm_view(v):
+    if v is None:
+        return None
+    return {k: (x if isinstance(x, bool) or x is None else [int(y) for y in x] if isinstance(x, list) else int(x))
+            for k, x in v.items()}
+
+
+def diff(a, b, path="") -> list:
+    """Расхождения двух нормальных форм: путь поля и оба значения."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = []
+        for k in sorted(set(a) | set(b), key=str):
+            if k not in a or k not in b:
+                out.append(f"{path}/{k}: эталон {a.get(k, '<нет>')!r} контракт {b.get(k, '<нет>')!r}")
+            else:
+                out += diff(a[k], b[k], f"{path}/{k}")
+        return out
+    return [] if a == b else [f"{path}: эталон {a!r} контракт {b!r}"]
+
+
+def run_fixture(art: dict, path, verbose: bool, paged: bool = False) -> list:
+    """Одна фикстура (файл или уже собранный словарь — `fuzz`) на своей цепи; расхождения — список строк (пусто — совпало).
+    Отказ служебного вызова посреди расчёта (пул заперт) — тоже расхождение с номером вызова, а не падение прогона."""
+    d = path if isinstance(path, dict) else json.load(open(path, encoding="utf-8"))
+    if d.get("schema") != FIXTURE_SCHEMA:
+        raise ValueError(f"{path}: схема {d.get('schema')!r}, дифференциал судит {FIXTURE_SCHEMA}")
+    chain = Chain()
+    try:
+        L = Ledger(chain, art, d["constants"], paged)
+        for k, (c, t) in enumerate(zip(d["calls"], d["trace"])):
+            try:
+                ok = L.apply(c)
+            except (ValueError, RpcError) as e:
+                return [f"вызов {k} {c['call']}: {e}"]
+            if ok != t["accepted"]:
+                return [f"вызов {k} {c}: эталон accepted={t['accepted']}, контракт {ok}"]
+            if "result" in t and ok and int(t["result"]) != L.result:      # ред. 9.4: строка вызова с результатом
+                return [f"вызов {k} {c}: результат эталон {t['result']}, контракт {L.result}"]
+            try:
+                got_state = L.state()
+            except (ValueError, RpcError) as e:                # выгрузка отказала или разошлась раскладка — это расхождение
+                return [f"вызов {k} {c['call']}: выгрузка состояния: {e}"]
+            bad = diff(norm_ref(t["state"]), got_state)
+            if bad:
+                return [f"вызов {k} {c['call']}: {x}" for x in bad[:12]]
+            if t.get("view"):
+                vref = t["view"]
+                try:
+                    got = L.views(vref["addr"])
+                except (ValueError, RpcError) as e:          # витрина отказала там, где эталон её посчитал, — расхождение
+                    return [f"вызов {k} {c['call']} витрина {vref['addr']}: {e}"]
+                bad = diff({"investor": norm_view(vref.get("investor")), "referrer": norm_view(vref.get("referrer"))},
+                           {"investor": got["investor"], "referrer": got["referrer"]})
+                if bad:
+                    return [f"вызов {k} {c['call']} витрина {vref['addr']}: {x}" for x in bad[:12]]
+            if verbose:
+                print(f"  {k:4d} {c['call']:<16} accepted={ok}")
+        fin = d.get("expected_final_views") or {}
+        for a, vref in fin.items():
+            try:
+                got = L.views(a)
+            except (ValueError, RpcError) as e:
+                return [f"финальная витрина {a}: {e}"]
+            bad = diff({"investor": norm_view(vref.get("investor")), "referrer": norm_view(vref.get("referrer"))},
+                       {"investor": got["investor"], "referrer": got["referrer"]})
+            if bad:
+                return [f"финальная витрина {a}: {x}" for x in bad[:12]]
+        return []
+    finally:
+        chain.close()
+
+
+def build():
+    r = subprocess.run([foundry("forge"), "build", "--no-lint"], cwd=CONTRACTS, capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        raise ValueError(f"forge build: {r.stdout[-2000:]}{r.stderr[-2000:]}")
+    for path in (ARTIFACT, VIEWS_ARTIFACT, MONDAY_ARTIFACT, PROJ_ARTIFACT, EMERGENCY_ARTIFACT, VAULT_ARTIFACT, LEG_ARTIFACT,
+                 VAULT_EM_ARTIFACT, BOOK_ARTIFACT):
+        if not os.path.isfile(path):
+            raise ValueError(f"нет артефакта {path}")
+    art = json.load(open(ARTIFACT, encoding="utf-8"))
+    art["views"] = json.load(open(VIEWS_ARTIFACT, encoding="utf-8"))
+    art["monday"] = json.load(open(MONDAY_ARTIFACT, encoding="utf-8"))
+    art["proj"] = json.load(open(PROJ_ARTIFACT, encoding="utf-8"))
+    art["emergency"] = json.load(open(EMERGENCY_ARTIFACT, encoding="utf-8"))
+    art["book"] = json.load(open(BOOK_ARTIFACT, encoding="utf-8"))
+    art["vault"] = json.load(open(VAULT_ARTIFACT, encoding="utf-8"))
+    art["leg"] = json.load(open(LEG_ARTIFACT, encoding="utf-8"))
+    art["vault_em"] = json.load(open(VAULT_EM_ARTIFACT, encoding="utf-8"))
+    views_abi_only_reads(art["views"])
+    views_abi_only_reads(art["proj"], "PoolLedgerProj")
+    return art
+
+
+def views_abi_only_reads(views: dict, name: str = "PoolLedgerViews"):
+    """PoolLedgerViews и PoolLedgerProj исполняются через fallback (delegatecall) НА ПАМЯТИ PoolLedger. Изменяющая функция
+    там стала бы записью в бухгалтерию в обход всех правил — поэтому в их ABI допустимы только view/pure. Отказ —
+    ValueError с именем."""
+    bad = [f["name"] for f in views["abi"] if f.get("type") == "function" and f.get("stateMutability") not in ("view", "pure")]
+    if bad:
+        raise ValueError(f"{name}: изменяющие функции {bad} — через delegatecall они писали бы в память бухгалтерии")
+
+
+def layout_of(name: str) -> tuple:
+    """([(имя, слот, смещение, тип)], таблица типов) — `forge inspect <name> storageLayout`."""
+    r = subprocess.run([foundry("forge"), "inspect", name, "storageLayout", "--json"], cwd=CONTRACTS, capture_output=True,
+                       text=True, encoding="utf-8", env=dict(os.environ, FOUNDRY_LINT_LINT_ON_BUILD="false"))
+    if r.returncode != 0:
+        raise ValueError(f"forge inspect {name} storageLayout: {r.stderr[-800:]}")
+    d = json.loads(r.stdout)
+    # поле `contract` у полей структур называет НАСЛЕДНИКА, а не раскладку — сравнивается всё, кроме него
+    types = {k: dict(t, members=[{f: m[f] for f in m if f != "contract"} for m in t["members"]]) if "members" in t else t
+             for k, t in d["types"].items()}
+    return [(v["label"], v["slot"], v["offset"], v["type"]) for v in d["storage"]], types
+
+
+def layout_mismatch(base: tuple, got: tuple):
+    """None — раскладки равны переменная к переменной и по таблице типов; иначе — первые расхождения строкой."""
+    if got == base:
+        return None
+    bad = [f"{a} != {b}" for a, b in zip(base[0], got[0]) if a != b][:3]
+    if len(base[0]) != len(got[0]):
+        bad.append(f"переменных {len(base[0])} против {len(got[0])}")
+    return "; ".join(bad) or "таблица типов"
+
+
+def storage_layout() -> dict:
+    """Раскладка памяти бухгалтерии: у каждой из LEDGER_PARTS — та же, что у PoolLedger. Реализация с иной раскладкой
+    писала бы делегированным вызовом в ЧУЖИЕ слоты PoolLedger. Ответ — {имя: слот}; расхождение — ValueError с именем."""
+    base = layout_of(LEDGER_PARTS[0])
+    if not base[0]:
+        raise ValueError(f"{LEDGER_PARTS[0]}: пустая раскладка памяти")
+    for name in LEDGER_PARTS[1:]:
+        why = layout_mismatch(base, layout_of(name))
+        if why:
+            raise ValueError(f"раскладка памяти {name} не равна {LEDGER_PARTS[0]}: {why}")
+    return {label: int(slot) for label, slot, _, _ in base[0]}
+
+
+def code_sizes(art: dict) -> dict:
+    """{контракт: (runtime, initcode)} в байтах по артефактам; за пределами EIP-170 / EIP-3860 — ValueError."""
+    out = {}
+    for key, name in (("", "PoolLedger"), ("views", "PoolLedgerViews"), ("monday", "PoolLedgerMonday"), ("proj", "PoolLedgerProj"),
+                      ("emergency", "PoolLedgerEmergency"), ("book", "PoolLedgerBook"), ("vault", "PoolVault"),
+                      ("leg", "TradingLeg"), ("vault_em", "PoolVaultEmergency")):
+        a = art[key] if key else art
+        rt = (len(a["deployedBytecode"]["object"]) - 2) // 2
+        ic = (len(a["bytecode"]["object"]) - 2) // 2
+        if rt > EIP170 or ic > EIP3860:
+            raise ValueError(f"{name}: runtime {rt} (EIP-170 {EIP170}), initcode {ic} (EIP-3860 {EIP3860})")
+        out[name] = (rt, ic)
+    return out
+
+
+def create_address(sender: str, nonce: int) -> str:
+    """Адрес CREATE (`sender`, `nonce`) — `cast compute-address` (keccak в stdlib нет)."""
+    r = subprocess.run([foundry("cast"), "compute-address", "--nonce", str(nonce), sender], capture_output=True, text=True)
+    out = r.stdout.strip().split()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+    if not (out.startswith("0x") and len(out) == 42):
+        raise ValueError(f"cast compute-address: {r.stdout[-300:]}{r.stderr[-300:]}")
+    return out.lower()
+
+
+def deploy_code(chain: "Chain", data: str, what: str) -> str:
+    """Одна транзакция создания с ключа цепи; отказ (размер кода, конструктор) — ValueError с именем."""
+    h = chain.rpc("eth_sendTransaction", {"from": chain.me, "data": data, "gas": hex(GAS)})
+    rc = chain.receipt(h)
+    if int(rc["status"], 16) != 1 or not rc.get("contractAddress"):
+        raise ValueError(f"деплой {what} не прошёл (конструктор или размер кода: EIP-170 / EIP-3860)")
+    return rc["contractAddress"].lower()
+
+
+def max_investors_bound() -> int:
+    """`MAX_INVESTORS_BOUND` контракта — из ЕГО исходника (второго числа не заводится): `max_investors = None` эталона
+    («предела нет») контракт выражает этой границей."""
+    m = re.findall(r"uint256 internal constant MAX_INVESTORS_BOUND = (\d+);", open(SOURCE, encoding="utf-8").read())
+    if len(m) != 1:
+        raise ValueError(f"MAX_INVESTORS_BOUND в {SOURCE}: найдено {len(m)} определений")
+    return int(m[0])
+
+
+def ledger_limits(constants: dict) -> tuple:
+    """(минимум депозита, предел адресов) конструктора из `constants` фикстуры v9; null предела — граница контракта."""
+    mi = constants["max_investors"]
+    return int(constants["min_deposit"]), max_investors_bound() if mi is None else int(mi)
+
+
+def max_gens_of(constants: dict) -> int:
+    """Предел поколений конструктора (ред. 9.5): `max_gens` из `constants` (фикстура 266, параметры деплоя); нет ключа или
+    null — 0, «правила нет» (эталон None)."""
+    return int(constants.get("max_gens") or 0)
+
+
+def ledger_ctor(constants: dict, views: str, monday: str, proj: str, emergency: str, owner: str, book: str) -> bytes:
+    return encode(["address"] + ["uint256"] * 8 + ["address"] * 6 + ["uint256"],
+                  [constants["treasury"], int(constants["buffer_bps"]), int(constants["fee_bps"]),
+                   int(constants["ref_share_bps"]), int(constants["hold_bps"]), int(constants["open_ref_share_bps"]),
+                   int(constants["partner_term_weeks"]), *ledger_limits(constants), views, monday, proj, emergency, owner,
+                   book, max_gens_of(constants)])
+
+
+def deploy_pool(chain: "Chain", art: dict, constants: dict, roles: dict, burn_nonce: bool = False) -> dict:
+    """ДЕПЛОЙ ПУЛА ПО КЕ10 с одного ключа, ПОДРЯД: реализации бухгалтерии (их пять, с PoolLedgerEmergency), затем бухгалтерия
+    и обе ноги на ВЫЧИСЛЕННЫЙ адрес хранилища (CREATE деплойера, nonce через четыре создания), модуль аварии хранилища
+    PoolVaultEmergency (ред. 9.4), затем само хранилище — оно сверяет связность конструктором.
+    Ответ — манифест (адреса, nonce, codehash каждой части, параметры). `burn_nonce` — стенд: перед хранилищем деплойер
+    тратит nonce на другое, и конструктор хранилища обязан отказать (по вычисленному адресу встаёт не оно)."""
+    parts = {name: deploy_code(chain, art[key]["bytecode"]["object"], name)
+             for key, name in (("views", "PoolLedgerViews"), ("monday", "PoolLedgerMonday"), ("proj", "PoolLedgerProj"),
+                               ("emergency", "PoolLedgerEmergency"), ("book", "PoolLedgerBook"))}
+    n = int(chain.rpc("eth_getTransactionCount", chain.me, "latest"), 16)
+    vault = create_address(chain.me, n + 4)
+    parts["PoolLedger"] = deploy_code(chain, art["bytecode"]["object"] + ledger_ctor(
+        constants, parts["PoolLedgerViews"], parts["PoolLedgerMonday"], parts["PoolLedgerProj"], parts["PoolLedgerEmergency"],
+        vault, parts["PoolLedgerBook"]).hex(), "PoolLedger")
+    for leg in ("TradingLegA", "TradingLegB"):
+        parts[leg] = deploy_code(chain, art["leg"]["bytecode"]["object"] + encode(["address"], [vault]).hex(), leg)
+    if burn_nonce:
+        chain.receipt(chain.rpc("eth_sendTransaction", {"from": chain.me, "to": chain.me, "value": "0x0"}))
+    # ред. 9.4: модуль аварии хранилища — до хранилища (его адрес — immutable хранилища); зависимостей у него нет, сроки
+    # триггеров — аргументы конструктора (параметры деплоя), их сверяет с DELAY конструктор хранилища
+    parts["PoolVaultEmergency"] = deploy_code(chain, art["vault_em"]["bytecode"]["object"] + encode(
+        ["uint256"] * len(EM_TERMS), [int(roles["terms"][k]) for k in EM_TERMS]).hex(), "PoolVaultEmergency")
+    # порядок полей VaultInit: ledger, legA, legB, admin, keeper, guardian, delay, tvlCap, legShareBps (C7), emergency (9.4)
+    init = encode(["address"] * 6 + ["uint256"] * 3 + ["address"],
+                  [parts["PoolLedger"], parts["TradingLegA"], parts["TradingLegB"], roles["admin"], roles["keeper"],
+                   roles["guardian"], int(roles["delay"]), int(roles["tvl_cap"]), int(roles["leg_share_bps"]),
+                   parts["PoolVaultEmergency"]])
+    parts["PoolVault"] = deploy_code(chain, art["vault"]["bytecode"]["object"] + init.hex(), "PoolVault")
+    if parts["PoolVault"] != vault:
+        raise ValueError(f"хранилище встало на {parts['PoolVault']}, а не на вычисленный {vault}")
+    return {"schema": MANIFEST_SCHEMA, "chain_id": int(chain.rpc("eth_chainId"), 16), "deployer": chain.me.lower(),
+            "vault_nonce": n + 4,
+            "constants": {k: constants[k] for k in ("treasury", "buffer_bps", "fee_bps", "ref_share_bps", "hold_bps",
+                                                    "open_ref_share_bps", "partner_term_weeks", "min_deposit", "max_investors",
+                                                    "max_gens")},
+            "roles": dict(roles),
+            "parts": {k: {"address": a, "codehash": code_hash(chain, a)}
+                      for k, a in parts.items()}}
+
+
+def keccak_hex(data: bytes) -> str:
+    """keccak256 байтов — `cast keccak` со stdin (keccak в stdlib нет; код части — десятки КБ, аргументом командной строки
+    Windows его не передать)."""
+    r = subprocess.run([foundry("cast"), "keccak"], input="0x" + data.hex(), capture_output=True, text=True)
+    out = r.stdout.strip()
+    if r.returncode != 0 or not (out.startswith("0x") and len(out) == 66):
+        raise ValueError(f"cast keccak: {r.stdout[-300:]}{r.stderr[-300:]}")
+    return out.lower()
+
+
+def code_hash(chain, addr: str) -> str:
+    """codehash части = keccak256 её кода (`eth_getCode`): то же, что `codeHash` аккаунта, но без `eth_getProof` — его RPC
+    боевой цепи может не отдавать (проверка после деплоя читает только `eth_chainId`/`eth_getCode`/`eth_call`/
+    `eth_getStorageAt`)."""
+    return keccak_hex(bytes.fromhex(chain.rpc("eth_getCode", addr, "latest")[2:]))
+
+
+def _masked(code: bytes, refs: dict) -> tuple:
+    """(код с обнулёнными immutable, [значения immutable по возрастанию]); у одного immutable во всех местах значение одно."""
+    b = bytearray(code); vals = []
+    for ranges in refs.values():
+        words = {bytes(code[r["start"]: r["start"] + r["length"]]) for r in ranges}
+        if len(words) != 1:
+            raise ValueError(f"immutable в {len(ranges)} местах кода несёт {len(words)} разных значений")
+        vals.append(int.from_bytes(words.pop(), "big"))
+        for r in ranges:
+            b[r["start"]: r["start"] + r["length"]] = bytes(r["length"])
+    return bytes(b), sorted(vals)
+
+
+def postdeploy_check(chain: "Chain", manifest: dict, art: dict) -> list:
+    """ПРОВЕРКА ПОСЛЕ ДЕПЛОЯ (КЕ10, В12 плана доверия): пусто — пул собран верно; иначе — расхождения с именем части.
+    Судится: (1) codehash каждой части на цепи = манифесту; (2) код каждой части = коду сборки байт в байт, у частей с
+    immutable — с обнулёнными immutable, а сами immutable = ожидаемым адресам и сроку; (3) владелец бухгалтерии (слот
+    раскладки) и хранилище каждой ноги — ровно хранилище манифеста, у хранилища — ровно эти бухгалтерия, ноги и роли;
+    (4) адреса реализаций в памяти бухгалтерии = манифесту; (5) раскладка памяти всех реализаций одна (`storage_layout`);
+    (6) состояние и параметры, а не только код (ревью 20.10, п. 7) — `postdeploy_state`: chain-id, `params()`, `initialized`,
+    пустые предложения таймлока, сроки модуля аварии по имени, активация хранилища и ног с долей на Core."""
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        return [f"манифест: схема {manifest.get('schema')!r}, проверка судит {MANIFEST_SCHEMA}"]
+    arts = {"PoolLedger": art, "PoolLedgerViews": art["views"], "PoolLedgerMonday": art["monday"], "PoolLedgerProj": art["proj"],
+            "PoolLedgerEmergency": art["emergency"], "PoolLedgerBook": art["book"], "PoolVault": art["vault"],
+            "TradingLegA": art["leg"],
+            "TradingLegB": art["leg"], "PoolVaultEmergency": art["vault_em"]}
+    missing = set(arts) - set(manifest["parts"])
+    if missing:
+        return [f"манифест: нет частей {sorted(missing)}"]
+    P = {k: v["address"].lower() for k, v in manifest["parts"].items()}
+    bad = []
+    if P["TradingLegA"] == P["TradingLegB"]:
+        bad.append("ноги A и B — один адрес")
+    word = lambda a: int(a, 16)
+    expect_imm = {"PoolVault": sorted([word(P["PoolLedger"]), word(P["TradingLegA"]), word(P["TradingLegB"]),
+                                       int(manifest["roles"]["delay"]), word(P["PoolVaultEmergency"])]),
+                  "TradingLegA": [word(P["PoolVault"])], "TradingLegB": [word(P["PoolVault"])],
+                  # сроки триггеров аварии — immutable модуля = параметрам манифеста
+                  "PoolVaultEmergency": sorted(int(manifest["roles"]["terms"][k]) for k in EM_TERMS)}
+    for name, a in arts.items():
+        got = bytes.fromhex(chain.rpc("eth_getCode", P[name], "latest")[2:])
+        if not got:
+            bad.append(f"{name}: по адресу {P[name]} нет кода"); continue
+        ch = keccak_hex(got)
+        if ch != manifest["parts"][name]["codehash"]:
+            bad.append(f"{name}: codehash {ch} против манифеста {manifest['parts'][name]['codehash']}")
+        want = bytes.fromhex(a["deployedBytecode"]["object"][2:])
+        refs = a["deployedBytecode"].get("immutableReferences") or {}
+        if len(got) != len(want):
+            bad.append(f"{name}: код {len(got)} байт против {len(want)} у сборки"); continue
+        try:
+            mg, vals = _masked(got, refs)
+        except ValueError as e:
+            bad.append(f"{name}: {e}"); continue
+        if mg != _masked(want, refs)[0]:
+            bad.append(f"{name}: код не равен коду сборки")
+        if vals != expect_imm.get(name, []):
+            bad.append(f"{name}: immutable {[hex(v) for v in vals]} против {[hex(v) for v in expect_imm.get(name, [])]}")
+    slots = storage_layout()
+
+    def slot_addr(label):
+        return "0x" + chain.rpc("eth_getStorageAt", P["PoolLedger"], hex(slots[label]), "latest")[-40:]
+    for label, part in (("owner", "PoolVault"), ("viewsImpl", "PoolLedgerViews"), ("mondayImpl", "PoolLedgerMonday"),
+                        ("projImpl", "PoolLedgerProj"), ("emergencyImpl", "PoolLedgerEmergency"), ("bookImpl", "PoolLedgerBook")):
+        got = slot_addr(label)
+        if got != P[part]:
+            bad.append(f"PoolLedger.{label} = {got}, а не {part} {P[part]}")
+
+    def getter(addr, a, sig):
+        return "0x" + chain.rpc("eth_call", {"to": addr, "data": "0x" + a["methodIdentifiers"][sig]}, "latest")[-40:]
+    lim = dec_fixed(bytes.fromhex(chain.rpc("eth_call", {"to": P["PoolLedger"], "data": "0x" + art["views"]["methodIdentifiers"]["limits()"]},
+                                            "latest")[2:]), 2)
+    if tuple(lim) != ledger_limits(manifest["constants"]):
+        bad.append(f"PoolLedger.limits() = {lim}, а не {ledger_limits(manifest['constants'])} манифеста")
+    # ред. 9.5: предел поколений = манифесту и задан (0 — «правила нет»: внеочередной расчёт без условия, поколений без предела)
+    mg = _call_words(chain, P["PoolLedger"], art["views"], "genLimits()", 3)[0]
+    if mg != max_gens_of(manifest["constants"]) or mg == 0:
+        bad.append(f"PoolLedger.genLimits().maxGens = {mg}, а не {manifest['constants'].get('max_gens')} манифеста (или 0 — "
+                   f"предела нет)")
+    for leg in ("TradingLegA", "TradingLegB"):
+        if getter(P[leg], art["leg"], "vault()") != P["PoolVault"]:
+            bad.append(f"{leg}.vault() — не хранилище манифеста")
+    for sig, part in (("ledger()", "PoolLedger"), ("legA()", "TradingLegA"), ("legB()", "TradingLegB"),
+                      ("emergency()", "PoolVaultEmergency")):
+        if getter(P["PoolVault"], art["vault"], sig) != P[part]:
+            bad.append(f"PoolVault.{sig} — не {part} манифеста")
+    for sig, key in (("admin()", "admin"), ("keeper()", "keeper"), ("guardian()", "guardian")):
+        if getter(P["PoolVault"], art["vault"], sig) != manifest["roles"][key].lower():
+            bad.append(f"PoolVault.{sig} — не {key} манифеста")
+    for sig, key in (("tvlCap()", "tvl_cap"), ("legShareBps()", "leg_share_bps")):
+        got = int(chain.rpc("eth_call", {"to": P["PoolVault"], "data": "0x" + art["vault"]["methodIdentifiers"][sig]}, "latest"), 16)
+        if got != int(manifest["roles"][key]):
+            bad.append(f"PoolVault.{sig} = {got}, а не {key} манифеста {manifest['roles'][key]}")
+    return bad + postdeploy_state(chain, manifest, art, P)
+
+
+def _call_words(chain: "Chain", to: str, a: dict, sig: str, n: int, args: bytes = b"") -> list:
+    """`eth_call` функции `sig` по ABI артефакта `a`: `n` слов ответа (знаковые, как `dec_fixed`)."""
+    out = chain.rpc("eth_call", {"to": to, "data": "0x" + a["methodIdentifiers"][sig] + args.hex()}, "latest")
+    return dec_fixed(bytes.fromhex(out[2:]), n)
+
+
+def core_user_exists(chain: "Chain", addr: str) -> bool:
+    """Прекомпайл Core `coreUserExists` (тот же вызов, что `PrecompileLib.coreUserExists`: `abi.encode(user)` без
+    селектора). Цепь без прекомпайла (пустой ответ) — ValueError: «не на Core» и «спросить нечем» — разные исходы."""
+    out = chain.rpc("eth_call", {"to": CORE_USER_EXISTS, "data": "0x" + encode(["address"], [addr]).hex()}, "latest")
+    if len(out) != 66:
+        raise ValueError(f"прекомпайл {CORE_USER_EXISTS} не ответил ({out!r}) — цепь без HyperCore")
+    return int(out, 16) != 0
+
+
+def timelock_kinds() -> list:
+    """Виды таймлока хранилища — 0..наибольший `P_*` исходников (`PoolVault.sol` и модуль аварии; второго перечня не
+    заводится). Промежуточные номера (4 — agent-ключ ноги B, `P_AGENT + 1`) входят диапазоном."""
+    vals = [int(v) for src in (VAULT_SOURCE, VAULT_EM_SOURCE)
+            for v in re.findall(r"uint256 (?:internal )?constant P_[A-Z]+ = (\d+);", open(src, encoding="utf-8").read())]
+    if not vals:
+        raise ValueError("виды таймлока не найдены в исходниках хранилища")
+    return list(range(max(vals) + 1))
+
+
+def postdeploy_state(chain: "Chain", manifest: dict, art: dict, P: dict) -> list:
+    """Ревью 20.10, п. 7 — что проверка после деплоя судила не всё: (1) chain-id манифеста = цепи; (2) параметры
+    бухгалтерии `params()` (owner, treasury и шесть чисел) = манифесту; (3) бухгалтерия не тронута (`initialized` = 0 —
+    его ставит первая же изменяющая операция); (4) ни одного висящего предложения таймлока; (5) сроки модуля аварии ПО
+    ИМЕНИ (сверка immutable — по отсортированному набору и перестановку сроков не видит); (6) хранилище и
+    каждая нога с долей в раздаче — на Core (нога с долей 0 не обязана: C7). Ревью-2, #5 / H1: `DELAY` цепи = манифесту и не
+    короче `MIN_DELAY` исходника, каждый срок >= 2·DELAY, `T_QUEUE_MAX` >= выведенной границы (`queue_max_floor`). Пусто —
+    чисто."""
+    bad = []
+    cid = int(chain.rpc("eth_chainId"), 16)
+    if manifest.get("chain_id") != cid:
+        bad.append(f"chain_id манифеста {manifest.get('chain_id')} — не цепь {cid}")
+    c = manifest["constants"]
+    pv = _call_words(chain, P["PoolLedger"], art["views"], "params()", 8)
+    got = {"owner": addr_of(pv[0]), "treasury": addr_of(pv[1]), "buffer_bps": pv[2], "fee_bps": pv[3],
+           "ref_share_bps": pv[4], "hold_bps": pv[5], "open_ref_share_bps": pv[6], "partner_term_weeks": pv[7]}
+    want = {"owner": P["PoolVault"], "treasury": str(c["treasury"]).lower(),
+            **{k: int(c[k]) for k in ("buffer_bps", "fee_bps", "ref_share_bps", "hold_bps", "open_ref_share_bps",
+                                      "partner_term_weeks")}}
+    bad += [f"PoolLedger.params().{k} = {got[k]}, а не {want[k]} манифеста" for k in want if got[k] != want[k]]
+    if _call_words(chain, P["PoolLedger"], art["views"], "status()", 13)[0] != 0:
+        bad.append("PoolLedger.status().initialized = 1: бухгалтерию уже меняли после деплоя")
+    for k in timelock_kinds():
+        h = _call_words(chain, P["PoolVault"], art["vault"], "proposals(uint256)", 2, encode(["uint256"], [k]))[0]
+        if h != 0:
+            bad.append(f"PoolVault.proposals({k}) не пусто: висит предложение таймлока")
+    delay = _call_words(chain, P["PoolVault"], art["vault"], "DELAY()", 1)[0]
+    if delay != int(manifest["roles"]["delay"]):
+        bad.append(f"PoolVault.DELAY() = {delay}, а не delay манифеста {manifest['roles']['delay']}")
+    if delay < min_delay():
+        bad.append(f"PoolVault.DELAY() = {delay} короче MIN_DELAY {min_delay()}")
+    for k in EM_TERMS:
+        t = _call_words(chain, P["PoolVaultEmergency"], art["vault_em"], f"{k.upper()}()", 1)[0]
+        if t != int(manifest["roles"]["terms"][k]):
+            bad.append(f"PoolVaultEmergency.{k.upper()}() = {t}, а не {k} манифеста {manifest['roles']['terms'][k]}")
+        if t < 2 * delay:
+            bad.append(f"PoolVaultEmergency.{k.upper()}() = {t} короче 2·DELAY {2 * delay}")
+    # ревью-2, H1: нога закрывает каждую позицию по календарю не позже `profit_target_force_close_d`, затем недельный расчёт —
+    # срок очереди обязан это пережить с запасом на окна keeper'а; нижняя граница выводится, а не задаётся числом
+    floor, why = queue_max_floor(manifest["roles"])
+    t = _call_words(chain, P["PoolVaultEmergency"], art["vault_em"], "T_QUEUE_MAX()", 1)[0]
+    if t < floor:
+        bad.append(f"PoolVaultEmergency.T_QUEUE_MAX() = {t} короче выведенной границы {floor} ({why})")
+    share = int(manifest["roles"]["leg_share_bps"])
+    need = [("PoolVault", True), ("TradingLegA", share > 0), ("TradingLegB", share < BPS)]
+    for part, must in need:
+        if not must:
+            continue
+        try:
+            if not core_user_exists(chain, P[part]):
+                bad.append(f"{part} {P[part]} не активирован на Core (coreUserExists = false)")
+        except ValueError as e:
+            bad.append(f"{part}: активацию на Core проверить нечем — {e}")
+    return bad
+
+
+# сроки триггеров аварии (ред. 9.4) — аргументы конструктора PoolVaultEmergency в этом порядке
+EM_TERMS = ("t_stuck", "t_dead", "t_nomonday", "t_serve", "t_queue_max")
+# Параметры беты — ЕДИНСТВЕННЫЙ источник чисел репетиции (второго набора сроков в коде нет): `deploy/params.beta.json`.
+PARAMS_BETA = os.path.join(CONTRACTS, "deploy", "params.beta.json")
+PARAMS_SCHEMA = "pool_deploy_params_v1"
+# адреса ролей и treasury репетиции (в файле параметров — плейсхолдеры `<…>`; ключей и адресов там нет)
+REHEARSAL_ADDR = {"admin": "0x" + "a1" * 20, "keeper": "0x" + "b2" * 20, "guardian": "0x" + "c3" * 20,
+                  "treasury": "0x" + "0" * 37 + "fee"}
+DAY_S = 24 * 3600
+
+
+def config_number(ref: str) -> float:
+    """`файл:ключ.ключ` от корня репозитория — число у ВЛАДЕЛЬЦА (`config/operational_limits.json`), а не копия."""
+    path, keys = ref.split(":", 1)
+    v = json.load(open(os.path.join(ROOT, path), encoding="utf-8"))
+    for k in keys.split("."):
+        if not isinstance(v, dict) or k not in v:
+            raise ValueError(f"{ref}: нет ключа {k}")
+        v = v[k]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{ref}: не число ({v!r})")
+    return v
+
+
+def min_delay() -> int:
+    """`MIN_DELAY` хранилища — из ЕГО исходника (второго числа не заводится)."""
+    m = re.findall(r"uint256 internal constant MIN_DELAY = (\d+) hours;", open(VAULT_SOURCE, encoding="utf-8").read())
+    if len(m) != 1:
+        raise ValueError(f"MIN_DELAY в {VAULT_SOURCE}: найдено {len(m)} определений")
+    return int(m[0]) * 3600
+
+
+def queue_max_floor(roles: dict) -> tuple:
+    """Нижняя граница `T_QUEUE_MAX` (ревью-2, H1/H1b): (принудительное закрытие позиции ногой по календарю + период расчёта)
+    в сутках + запас на окна keeper'а. Первое слагаемое — у владельца (`config/operational_limits.json`), остальное — поля
+    `queue_floor` параметров / манифеста. Ответ — (секунды, вывод строкой)."""
+    q = roles.get("queue_floor")
+    if not isinstance(q, dict) or set(q) != {"force_close_source", "settle_d", "keeper_margin_s"}:
+        raise ValueError(f"queue_floor: ждали force_close_source, settle_d, keeper_margin_s — есть {q!r}")
+    fc = config_number(q["force_close_source"])
+    if fc <= 0 or int(fc) != fc or int(q["settle_d"]) <= 0 or int(q["keeper_margin_s"]) < 0:
+        raise ValueError(f"queue_floor: негодные слагаемые {fc}, {q['settle_d']}, {q['keeper_margin_s']}")
+    floor = (int(fc) + int(q["settle_d"])) * DAY_S + int(q["keeper_margin_s"])
+    return floor, f"{int(fc)} сут закрытия + {int(q['settle_d'])} сут расчёта + {int(q['keeper_margin_s'])} с запаса"
+
+
+def load_params(path: str = PARAMS_BETA) -> dict:
+    """Файл параметров деплоя: схема, роли-плейсхолдеры, числа хранилища и сроки, вывод границы очереди, константы
+    бухгалтерии (TBD — решение оператора; ссылка `файл:ключ` — число владельца, `hold_bps` = катастрофический стоп × BPS).
+    Ответ — {"roles": ..., "constants": ..., "tbd": [...]}; негодное — ValueError с именем."""
+    d = json.load(open(path, encoding="utf-8"))
+    if d.get("schema") != PARAMS_SCHEMA:
+        raise ValueError(f"{path}: схема {d.get('schema')!r}, ждали {PARAMS_SCHEMA}")
+    v, t, led = d["vault"], d["terms"], d["ledger"]
+    if set(t) != set(EM_TERMS):
+        raise ValueError(f"{path}: сроки {sorted(t)} против {sorted(EM_TERMS)}")
+    roles = dict(d["roles"], delay=int(v["delay"]), tvl_cap=int(v["tvl_cap"]), leg_share_bps=int(v["leg_share_bps"]),
+                 terms={k: int(t[k]) for k in EM_TERMS}, queue_floor=dict(d["queue_floor"]))
+    queue_max_floor(roles)                                      # вывод границы обязан считаться уже на файле
+    tbd = []; const = {}
+    for k in ("treasury", "min_deposit", "max_investors", "fee_bps", "ref_share_bps", "open_ref_share_bps", "hold_bps",
+              "buffer_bps", "partner_term_weeks", "max_gens"):
+        x = led[k]
+        if x == "TBD":
+            tbd.append(k); const[k] = None
+        elif k == "hold_bps" and isinstance(x, str):
+            const[k] = round(config_number(x) * BPS)
+        else:
+            const[k] = x
+    const["partners"] = list(led["partners"])
+    return {"roles": roles, "constants": const, "tbd": tbd}
+
+
+def rehearsal_roles(params: dict = None) -> dict:
+    """Роли и числа хранилища репетиции — из параметров беты, плейсхолдеры адресов — адресами репетиции."""
+    r = json.loads(json.dumps((params or load_params())["roles"]))
+    for k in ("admin", "keeper", "guardian"):
+        if not str(r[k]).startswith("<"):
+            raise ValueError(f"параметры: роль {k} — не плейсхолдер ({r[k]}): адресов ролей в файле параметров быть не должно")
+        r[k] = REHEARSAL_ADDR[k]
+    return r
+
+
+def rehearsal_core(chain: "Chain", inactive: str = "0x" + "0" * 40):
+    """Репетиция на anvil: HyperCore нет, и прекомпайл `coreUserExists` ставится заглушкой — «на Core» любой адрес, кроме
+    `inactive` (стенд неактивированной части). На боевой цепи прекомпайл настоящий; без заглушки проверка после деплоя
+    называет «проверить нечем», а не «чисто». Код: `return iszero(eq(calldataload(0), inactive))`."""
+    code = "0x600035" + "73" + inactive[2:].lower() + "1415" + "600052" + "60206000f3"
+    chain.rpc("anvil_setCode", CORE_USER_EXISTS, code)
+
+
+def rehearsal_constants(params: dict = None) -> dict:
+    """Параметры бухгалтерии репетиции — из параметров беты; поле `TBD` (ставки — решение оператора) — из первой фикстуры
+    эталона (своих чисел не заводится), treasury-плейсхолдер — адресом репетиции. Ответ — в форме `constants` фикстуры."""
+    P = params or load_params()
+    c = dict(json.load(open(cases()[0][1], encoding="utf-8"))["constants"])
+    for k, x in P["constants"].items():
+        if k == "treasury":
+            c[k] = REHEARSAL_ADDR["treasury"] if str(x).startswith("<") else x
+        elif x is not None:
+            c[k] = x if k == "partners" else str(x)
+    return c
+
+
+def cmd_rehearse(args) -> int:
+    """Репетиция деплоя КЕ10 на своей цепи: порядок, манифест, проверка после деплоя, размеры. Сети не касается."""
+    art = build()
+    for name, (rt, ic) in code_sizes(art).items():
+        print(f"  {name:18} runtime {rt:6} (запас EIP-170 {EIP170 - rt:6})  initcode {ic:6} (запас EIP-3860 {EIP3860 - ic:6})")
+    params = load_params()
+    print(f"  параметры: {os.path.relpath(PARAMS_BETA, ROOT)}; TBD (решение оператора, в репетиции — числа фикстуры): "
+          f"{params['tbd'] or 'нет'}; граница T_QUEUE_MAX: {queue_max_floor(params['roles'])[1]}")
+    chain = Chain()
+    try:
+        m = deploy_pool(chain, art, rehearsal_constants(params), rehearsal_roles(params))
+        rehearsal_core(chain)
+        bad = postdeploy_check(chain, m, art)
+    finally:
+        chain.close()
+    if args.out:
+        json.dump(m, open(args.out, "w", encoding="utf-8"), indent=1)
+        print(f"  манифест: {args.out}")
+    for x in bad:
+        print("   ", x)
+    print(f"REHEARSE: {'PASS' if not bad else 'FAIL'} (частей {len(m['parts'])}, хранилище — nonce {m['vault_nonce']})")
+    return 1 if bad else 0
+
+
+class RemoteChain:
+    """Цепь по RPC-адресу — ТОЛЬКО ЧТЕНИЕ (ревью-2, #7): проверка после деплоя на боевой цепи. Методы — закрытый перечень
+    `READ_ONLY` (`eth_chainId`, `eth_getCode`, `eth_call`, `eth_getStorageAt`); любой другой — ValueError ДО сети: ни
+    отправки транзакций, ни подписи, ни ключей у класса нет. Запросы — с интервалом `spacing` секунд (публичный RPC HyperEVM
+    ограничивает частоту; повторов нет — отказ RPC есть отказ проверки, fail-loud)."""
+    READ_ONLY = ("eth_chainId", "eth_getCode", "eth_call", "eth_getStorageAt")
+
+    def __init__(self, url: str, spacing: float):
+        if not url.startswith(("http://", "https://")):
+            raise ValueError(f"--rpc: ждали http(s)://…, а не {url!r}")
+        if spacing < 0:
+            raise ValueError(f"--spacing {spacing} < 0")
+        self.url, self.spacing, self.last, self.calls = url, spacing, 0.0, []
+
+    def rpc(self, method, *params):
+        if method not in self.READ_ONLY:
+            raise ValueError(f"RemoteChain: метод {method} вне перечня только-чтения {self.READ_ONLY}")
+        import urllib.request
+        wait = self.last + self.spacing - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)}).encode()
+        req = urllib.request.Request(self.url, body, {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                out = json.loads(resp.read())
+        finally:
+            self.last = time.monotonic()
+        self.calls.append(method)
+        if "error" in out:
+            raise RpcError(out["error"])
+        return out["result"]
+
+
+def cmd_postdeploy(args) -> int:
+    """Проверка после деплоя ПО РЕАЛЬНОЙ ЦЕПИ (ревью-2, #7): тот же `postdeploy_check` (код частей против ЛОКАЛЬНОЙ сборки
+    этого дерева, связность, `postdeploy_state`), что у репетиции, но цепь — RPC-адрес только для чтения (`RemoteChain`).
+    Деплоя, подписи и ключей нет. rc 0 — чисто; иначе расхождения поимённо."""
+    manifest = json.load(open(args.manifest, encoding="utf-8"))
+    art = build()
+    chain = RemoteChain(args.rpc, args.spacing)
+    bad = postdeploy_check(chain, manifest, art)
+    for x in bad:
+        print("   ", x)
+    print(f"POSTDEPLOY: {'PASS' if not bad else 'FAIL'} (цепь {manifest.get('chain_id')}, частей {len(manifest.get('parts', {}))}, "
+          f"запросов RPC {len(chain.calls)}: {sorted(set(chain.calls))})")
+    return 1 if bad else 0
+
+
+# Фикстуры v9, которые дифференциал НЕ гонит, — поимённо и с причиной (не молча: `cases` отказывает, если такой файл
+# исчез). Ред. 9.4 «замороженный пул» перенесена (PoolLedgerEmergency, правило E — `emergencyDue`): исключений нет, и
+# selftest C17 судит, что фикстуры с вызовами аварии (236-239, 260, 261) — в прогоне.
+EXCLUDED_FIXTURES = {}
+EMERGENCY_CALLS = ("emergency_freeze", "emergency_due")
+
+
+def cases(only=None) -> list:
+    """[(имя, файл фикстуры)] — все фикстуры v9 с диска (сценарии ред. 9.1 — скриптовые 213-220, ред. 9.2.1/9.2.2 и пакета
+    безопасности — 240-255, ред. 9.3/9.3.1/9.3.1.1 — частичное закрытие 231-235, 300-303, 310-311), КРОМЕ
+    `EXCLUDED_FIXTURES` (сегодня пусто; ред. 9.4 — замороженный пул 236-239, 260, 261 — в прогоне)."""
+    files = sorted(glob.glob(os.path.join(FIXTURES, "scenario_*.json")))
+    if len(files) == 0:
+        raise ValueError(f"фикстур не найдено в {FIXTURES}")
+    names = {os.path.basename(f) for f in files}
+    gone = sorted(set(EXCLUDED_FIXTURES) - names)
+    if gone:
+        raise ValueError(f"исключённых фикстур нет на диске: {gone} — список исключений устарел")
+    return [(os.path.basename(f), f) for f in files
+            if os.path.basename(f) not in EXCLUDED_FIXTURES and (not only or only in os.path.basename(f))]
+
+
+def run_many(art: dict, jobs: list, workers: int, stop_on_red: bool = False) -> dict:
+    """[(ключ, файл, paged)] -> {ключ: (расхождения, секунды)}. Каждая фикстура — своя цепь; их гонят `workers` потоков
+    (работа — ожидание anvil, а не питон). `stop_on_red` — после первого расхождения новые не начинаются (их ключей в
+    ответе нет)."""
+    from concurrent.futures import ThreadPoolExecutor
+    out = {}; red = threading.Event()
+
+    def one(key, f, paged):
+        if stop_on_red and red.is_set():
+            return
+        t0 = time.time(); bad = run_fixture(art, f, False, paged)
+        out[key] = (bad, time.time() - t0)
+        if bad:
+            red.set()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for fut in [ex.submit(one, *j) for j in jobs]:
+            fut.result()
+    return out
+
+
+# --- очередь заявок: сценарии эталона с ДЛИННОЙ очередью ----------------------------------------------------- #
+# Фикстуры v8 держат в очереди не больше 5 заявок (замер 17.10), а очередь контракта — полоса сумм по ключу и поиск точки
+# упора по id (`_fifoPay`): судить её надо там, где заявок много, ключи перемежаются, ликвидность упирается посреди потока,
+# каскад убытка снимает хвост, а новая заявка встаёт после снятого хвоста. Сценарии генерирует ЭТАЛОН (суммы — по его
+# состоянию), трассу — его же `replay`; дифференциал судит их так же, как фикстуры.
+def reference():
+    return sys.modules.get("vault_accounting_ref") or SourceFileLoader(
+        "vault_accounting_ref", os.path.join(ROOT, "runtime", "vault_accounting.pytxt")).load_module()
+
+
+def queue_calls(seed: int, n_ops: int = 320) -> list:
+    VA = reference(); rng = random.Random(seed); L = VA._scenario_ledger(); calls = []; npid = 0
+    addrs = [VA.A_(i) for i in range(1, 9)]
+
+    def step(c):
+        calls.append(c); VA.apply_call(L, c)
+    for i, a in enumerate(addrs):
+        step({"call": "deposit", "addr": a, "amount": rng.randint(200, 3000) * 10 ** 6, "referrer": None,
+              "payout": rng.random() < 0.3, "path": "evm", "ledger_ref": None})
+    step({"call": "sweep_to_perp"})
+    ops = ["wtiny"] * 22 + ["wfrac"] * 6 + ["rw"] * 3 + ["wd"] * 7 + ["pay"] * 5 + ["size"] * 4 + ["fill"] * 4 +           ["mark"] * 4 + ["close"] * 3 + ["cancel"] + ["monday"] * 3 + ["claim"] * 3 + ["dep"] * 3 + ["payout"] * 2 + ["sweep"] * 2
+    for _ in range(n_ops):
+        op = rng.choice(ops); a = rng.choice(addrs); c = None
+        if op in ("wtiny", "wfrac"):
+            free = L.free_stake(a)
+            if free:
+                amt = rng.choice([1, rng.randint(1, 10 ** 6), rng.randint(1, 10 ** 8)]) if op == "wtiny" else free * rng.randint(1000, 10_000) // 10_000
+                c = {"call": "withdraw", "addr": a, "reward": False, "amount": max(1, min(free, amt))}
+        elif op == "rw":
+            who = rng.choice(addrs + [VA.SCENARIO_TREASURY]); free = L.free_stake(who, True)
+            if free:
+                c = {"call": "withdraw", "addr": who, "reward": True, "amount": max(1, free * rng.randint(1000, 10_000) // 10_000)}
+        elif op == "wd":
+            c = {"call": "set_withdrawable", "amount": max(0, L.venue_value()) * rng.randint(0, 10_000) // 10_000}
+        elif op == "pay":
+            c = {"call": "pay_queue"}
+        elif op == "size":
+            c = {"call": "size_order", "pid": f"q{npid}", "notional": L.sizing_capital() * rng.randint(2000, 30_000) // 10_000}
+            npid += 1
+        elif op in ("fill", "cancel", "mark", "close"):
+            want = "sized" if op in ("fill", "cancel") else "open"
+            pids = sorted(q for q, o in L.orders.items() if o["state"] == want)
+            if pids:
+                q = rng.choice(pids); x = L.orders[q]["notional"] * rng.randint(-8000, 3000) // 10_000
+                c = {"fill": {"call": "fill_order", "pid": q}, "cancel": {"call": "cancel_order", "pid": q},
+                     "mark": {"call": "mark_position", "pid": q, "upnl": x}, "close": {"call": "close_position", "pid": q, "realized": x}}[op]
+        elif op == "monday":
+            step({"call": "monday"}); c = {"call": "treasury_payout"}
+        elif op == "claim":
+            c = {"call": "claim", "addr": rng.choice(addrs + [VA.SCENARIO_TREASURY])}
+        elif op == "dep":
+            c = {"call": "deposit", "addr": a, "amount": rng.randint(1, 2000) * 10 ** 6, "referrer": None, "payout": None,
+                 "path": "evm", "ledger_ref": None}
+        elif op == "payout":
+            c = {"call": "set_payout_mode", "addr": a, "payout": rng.random() < 0.5}
+        elif op == "sweep":
+            c = {"call": "sweep_to_perp"}
+        if c is not None:
+            step(c)
+    return calls
+
+
+def queue_fixture(seed: int) -> dict:
+    return ref_fixture(queue_calls(seed))
+
+
+# --- зачёт циклов книги (ред. 9.2): сценарии эталона с ПЛОТНОЙ книгой доплативших ------------------------------------ #
+# Фикстуры 221-224 держат два-три адреса: путь зачёта там один, работа получателя в очереди возвратов не встречается дважды,
+# а порядок адресов совпадает с порядком регистрации. Порядок соседей поиска пути, порядок записи долей одного должника
+# (по адресу, а не по регистрации), слияние работ и то, что поиск видит книгу ровно на момент записи, судят сценарии
+# `cycle_NNN` (`--cycles N`): 10 адресов, зарегистрированных НЕ по возрастанию, 16 недель; каждую неделю часть вносит,
+# ордер на 1.0-1.4 капитала, 1-3 «выходят» до закрытия (их доля убытка — недостача, её доплачивают остальные), убыток
+# 40-70 % или прибыль 5-40 %. Книга растёт и замыкается (бывший доплативший становится должником того, за кого платил).
+# `cycle_pool` — скриптовый: недостачу A частью доплачивает B своим реферальным вознаграждением, а сам B в той же неделе
+# должен ПУЛУ (дыра): долг перед пулом в цикл не входит.
+def cycle_calls(seed: int, weeks: int = 16, n: int = 10) -> list:
+    VA = reference(); rng = random.Random(seed); L = VA._scenario_ledger(); calls = []; npid = 0
+    addrs = [VA.A_(0xd000 + x) for x in rng.sample(range(1, 250), n)]
+    dep = lambda a, usd: {"call": "deposit", "addr": a, "amount": usd * VA.USD, "referrer": None, "payout": None, "path": "evm",
+                          "ledger_ref": None}
+
+    def step(c):
+        calls.append(c); VA.apply_call(L, c)
+    for a in addrs:
+        step(dep(a, rng.randint(200, 3000)))
+    for _ in range(weeks):
+        for a in addrs:
+            if rng.random() < 0.5:
+                step(dep(a, rng.randint(50, 2000)))
+        step({"call": "sweep_to_perp"})
+        cap = L.sizing_capital()
+        if cap <= 0:
+            continue
+        pid = f"c{npid}"; npid += 1
+        step({"call": "size_order", "pid": pid, "notional": cap * rng.randint(10_000, 14_000) // 10_000})
+        step({"call": "fill_order", "pid": pid})
+        if pid not in L.orders:
+            continue
+        losers = rng.sample(addrs, rng.randint(1, 3))
+        for a in losers:
+            free = L.free_stake(a)
+            if free:
+                step({"call": "withdraw", "addr": a, "reward": False, "amount": free})
+        step({"call": "set_withdrawable", "amount": max(0, L.venue_value())})
+        step({"call": "pay_queue"})
+        for a in losers:
+            step({"call": "claim", "addr": a})
+        if L.orders.get(pid, {}).get("state") == "open":
+            pm = rng.randint(-700, -400) if rng.random() < 0.6 else rng.randint(50, 400)
+            step({"call": "close_position", "pid": pid, "realized": L.orders[pid]["notional"] * pm // 1000})
+        step({"call": "set_withdrawable", "amount": max(0, L.venue_value())})
+        step({"call": "monday"})
+        step({"call": "treasury_payout"})
+    return calls
+
+
+def cycle_pool_calls() -> list:
+    VA = reference(); L = VA._scenario_ledger(); calls = []; U = VA.USD
+    A, B, C = VA.A_(0xe1), VA.A_(0xe2), VA.A_(0xe3)
+    dep = lambda a, usd, ref=None: {"call": "deposit", "addr": a, "amount": usd * U, "referrer": ref, "payout": None,
+                                    "path": "evm", "ledger_ref": None}
+
+    def step(c):
+        calls.append(c)
+        if not VA.apply_call(L, c):
+            raise ValueError(f"cycle_pool: эталон отклонил {c}")
+    for c in (dep(A, 1000), dep(B, 1000), {"call": "sweep_to_perp"}, {"call": "size_order", "pid": "g1", "notional": 2000 * U},
+              {"call": "fill_order", "pid": "g1"}):
+        step(c)
+    for a in (A, B):
+        step({"call": "withdraw", "addr": a, "reward": False, "amount": L.free_stake(a)})
+    step({"call": "set_withdrawable", "amount": max(0, L.venue_value())}); step({"call": "pay_queue"})
+    for a in (A, B):
+        step({"call": "claim", "addr": a})
+    for c in (dep(C, 10, ref=B), {"call": "sweep_to_perp"}, {"call": "size_order", "pid": "g2", "notional": 100 * U},
+              {"call": "fill_order", "pid": "g2"}, {"call": "close_position", "pid": "g2", "realized": 700 * U}):
+        step(c)
+    step({"call": "close_position", "pid": "g1", "realized": -(L.venue_value() - 5 * U)})
+    step({"call": "set_withdrawable", "amount": max(0, L.venue_value())}); step({"call": "monday"})
+    if not (L.creditors.get(A, {}).get(B) and L.creditors.get(B, {}).get(None)):
+        raise ValueError(f"cycle_pool: книга без A -> B и B -> пул: {L.creditors}")
+    return calls
+
+
+# --- ред. 9.2.1: книга «обратный треугольник» (i должен всем j < i) — худший вход проекции фазы 2 (спека 8.11.1) ----- #
+# Фикстуры 240-252 держат два-шесть адресов: проекция там — одна-две работы. Здесь возврат должника идёт по всем рёбрам
+# вниз, а получатели сами должники: работ — волнами, слияние в каждой волне, недостача по маркам рядом (поколения с
+# бумажным убытком). Та же конструкция, что у forge-стенда газа `test_rev921_triangle_*` (PoolLedgerGasTest).
+def triangle_calls(n: int = 12, G: int = 2) -> list:
+    VA = reference(); L = VA._scenario_ledger(); calls = []; U = VA.USD
+    A = [VA.A_(0x5000 + i) for i in range(n)]
+
+    def step(c, must=True):
+        calls.append(c)
+        if not VA.apply_call(L, c) and must:
+            raise ValueError(f"triangle: эталон отклонил {c}")
+    dep = lambda a, x: {"call": "deposit", "addr": a, "amount": x, "referrer": None, "payout": None, "path": "evm", "ledger_ref": None}
+    step(dep(A[0], 1000 * U))
+    for k in range(1, n):
+        step(dep(A[k], 1000 * U)); step({"call": "sweep_to_perp"})
+        nt = L.sizing_capital() // 10; pid = f"t{k}"
+        step({"call": "size_order", "pid": pid, "notional": nt}); step({"call": "fill_order", "pid": pid})
+        free = L.free_stake(A[k])
+        step({"call": "set_withdrawable", "amount": free}); step({"call": "withdraw", "addr": A[k], "reward": False, "amount": free})
+        step({"call": "claim", "addr": A[k]})
+        step({"call": "close_position", "pid": pid, "realized": -(nt * 99 // 100)}); step({"call": "set_withdrawable", "amount": 0})
+        step({"call": "monday"})
+        for j in range(k + 1):
+            s_ = L.free_stake(A[j])
+            if s_ < 1000 * U:
+                step(dep(A[j], 1000 * U - s_))
+    if sum(1 for a in L.creditors for b in L.creditors[a] if b is not None) != n * (n - 1) // 2:
+        raise ValueError("triangle: книга не «i должен всем j < i»")
+    step({"call": "sweep_to_perp"})
+    for j in range(G):
+        pid = f"g{j}"
+        step({"call": "size_order", "pid": pid, "notional": n * 10 * U}); step({"call": "fill_order", "pid": pid})
+        step({"call": "mark_position", "pid": pid, "upnl": -(j + 1) * U})
+    step({"call": "size_order", "pid": "win", "notional": n * 100 * U}); step({"call": "fill_order", "pid": "win"})
+    step({"call": "close_position", "pid": "win", "realized": n * U})
+    if not L._repay_projection()["stake"]:
+        raise ValueError("triangle: проекция возврата пуста — сценарий не судит вес 9.2.1")
+    step({"call": "size_order", "pid": "probe", "notional": n * U})
+    step({"call": "set_withdrawable", "amount": max(0, L.venue_value())})
+    step({"call": "withdraw", "addr": A[1], "reward": False, "amount": 10 * U}, must=False)
+    step({"call": "claim", "addr": A[1]}, must=False)
+    step(dep(A[1], 10 * U), must=False)
+    step({"call": "pay_queue"})
+    for pid in [q for q, o in L.orders.items() if o["state"] == "open"]:
+        step({"call": "close_position", "pid": pid, "realized": L.orders[pid]["upnl"]})
+    step({"call": "set_withdrawable", "amount": max(0, L.venue_value())})
+    step({"call": "monday"})
+    return calls
+
+
+def cycle_cases(n: int) -> list:
+    """[(имя, словарь-фикстура)] — скриптовые `cycle_pool` и `triangle_012`, затем `n` случайных сценариев плотной книги
+    (seed 0..n−1); пусто при n = 0."""
+    if n <= 0:
+        return []
+    return ([("cycle_pool", ref_fixture(cycle_pool_calls())), ("triangle_012", ref_fixture(triangle_calls()))]
+            + [(f"cycle_{s:03d}", ref_fixture(cycle_calls(s))) for s in range(n)])
+
+
+def ref_fixture(calls: list) -> dict:
+    """Вызовы -> фикстура: трассу (принятие, состояние, витрины) пишет ЭТАЛОН своим `replay`."""
+    VA = reference(); L, trace = VA.replay(calls)
+    return json.loads(json.dumps({"schema": VA.FIXTURE_SCHEMA, "constants": {
+        "fee_bps": L.fee_bps, "ref_share_bps": L.ref_share_bps, "open_ref_share_bps": L.open_ref_share_bps,
+        "hold_bps": L.hold_bps, "buffer_bps": L.buffer_bps, "treasury": L.treasury, "partners": list(VA.SCENARIO_PARTNERS),
+        "partner_term_weeks": L.partner_term_weeks, "min_deposit": L._min_deposit, "max_investors": L._max_investors},
+        "calls": calls, "trace": trace}, default=str))
+
+
+def queue_cases(n: int) -> list:
+    """[(имя, словарь-фикстура)] — `n` сценариев с длинной очередью (seed 0..n−1)."""
+    return [(f"queue_{s:03d}", queue_fixture(s)) for s in range(n)]
+
+
+def cmd_run(args) -> int:
+    art = build()
+    todo = cases(args.only) + queue_cases(args.fuzz) + cycle_cases(args.cycles)
+    if not todo:
+        raise ValueError(f"ничего не выбрано по «{args.only}»")
+    if args.verbose:
+        res = {}
+        for n, f in todo:
+            t0 = time.time(); res[n] = (run_fixture(art, f, True, args.paged), time.time() - t0)
+    else:
+        res = run_many(art, [(n, f, args.paged) for n, f in todo], args.jobs)
+    fails = 0
+    for name, _ in todo:
+        bad, sec = res[name]
+        if bad:
+            fails += 1
+            print(f"[FAIL] {name} ({sec:.1f} с)")
+            for x in bad:
+                print("   ", x)
+        else:
+            print(f"[OK]   {name} ({sec:.1f} с)")
+    form = "" if not args.paged else " --paged" if args.paged == 1 else f" --paged-k {args.paged}"
+    print(f"DIFF{form}: {'PASS' if not fails else 'FAIL'} ({len(todo) - fails}/{len(todo)})")
+    if args.fuzz:
+        VA = reference(); qmax = 0
+        for name, d in todo[len(todo) - args.fuzz - (args.cycles + 2 if args.cycles > 0 else 0):][:args.fuzz]:
+            qmax = max(qmax, max(len(t["state"]["queue"]) for t in d["trace"]))
+        print(f"   сценарии очереди: {args.fuzz}, наибольшая очередь {qmax} заявок")
+    return 1 if fails else 0
+
+
+# --- саботаж: дифференциал обязан краснеть на каждом мутанте ----------------------------------------------- #
+SOURCE = os.path.join(CONTRACTS, "src", "PoolLedger.sol")
+# значение — пара (образец, замена) или список пар: мутант правила ред. 9 иногда задевает два места одного правила.
+# Судьи: сначала фикстуры (дифференциал, обе формы недельного расчёта), затем — только если фикстуры зелёные — forge-стенды
+# `PoolLedgerTest` (числа в них посчитаны эталоном): так видны правила, которых фикстуры не исполняют (вердикт печатает,
+# какой судья покраснел).
+MUTANTS = {
+    "attr: убыток округлён к нулю, а не против держателя":
+        ("return -int256((uint256(s) * neg + uint256(total) - 1) / uint256(total));",
+         "return -int256((uint256(s) * neg) / uint256(total));"),
+    "_takeOwn: капитал снимается лишь наполовину — остальное уходит из следующих плоскостей":
+        ("int256 take = _min(need, r.stake);", "int256 take = _min(need, r.stake) / 2;"),
+    "вес без вычета комиссии":
+        ("P.weight = _max(0, r.stake + net - (_max(0, r.cumPnl + net - r.hwm) * feeBps) / BPS);",
+         "P.weight = _max(0, r.stake + net);"),
+    # «`liq <= unpaid` -> `<`» ЭКВИВАЛЕНТЕН (при равенстве платится min(cap, 0) = 0) и судить им нечего — замер 08.10
+    "второй проход очереди: reward платится из ВСЕЙ ликвидности, обгоняя заявки инвесторов (IM-3)":
+        ("_fifoPay(rk, rc, mr, true, liq - unpaid, rq);", "_fifoPay(rk, rc, mr, true, liq, rq);"),
+    "партнёрский срок: `>` заменён на `>=` (на одну неделю короче)":
+        ("if (week > _max(first, p.sinceWeek) + partnerTermWeeks) return openRefShareBps;",
+         "if (week >= _max(first, p.sinceWeek) + partnerTermWeeks) return openRefShareBps;"),
+    "потолок комиссии не учитывает удержание":
+        ("int256 avail = _max(0, _ownPlanes(a) + delta - _exposureHold(a));", "int256 avail = _max(0, _ownPlanes(a) + delta);"),
+    "максимум поднимается на всю базу, даже когда комиссию срезал потолок":
+        ("r.hwm += fee == full ? base : _min(base, (fee * BPS) / feeBps);", "r.hwm += base;"),
+    "удержание округлено вниз":
+        ("int256 byHold = int256(_ceilDivU(share * uint256(holdBps), uint256(BPS)));",
+         "int256 byHold = int256((share * uint256(holdBps)) / uint256(BPS));"),
+    "пыль закрытого поколения не уходит в котёл":
+        ("_credit(treasury, dust, PL_POT);", ""),
+    "снимок поколения никогда не переиспользуется":
+        ("if (!_snapEquals(gen, w)) {", "if (true) {"),
+    "гейт депозита при долге пула снят":
+        ("if (_projectedShortfall() > 0) revert", "if (false) revert"),
+    "потолок суммы капиталов uint128 снят":
+        ("if (stakeSum + extra + growSum > int256(U128_MAX)) revert", "if (false) revert"),
+    # этап 5а: ведущиеся суммы обязаны обновляться КАЖДЫМ писателем — забытое обновление судит дифференциал
+    "сумма капиталов не уменьшается при выводе":
+        ("stakeSum -= amt;", ""),
+    "сумма заявок не уменьшается при снятии из очереди и выплате":
+        ("        queuedSum += delta;", "        if (delta > 0) queuedSum += delta;"),
+    "сумма «к получению» не уменьшается при снятии":
+        ("claimableSum -= need - rest;", ""),
+    # этап 5б (ред. 9): граница «проектного убытка нет» обязана быть ВЕРНОЙ — каждое ослабление делает быстрый путь ложным
+    "граница «убытка нет» без бумажных убытков":
+        ("return lossRN == 0 && lossOpenN == 0;", "return lossRN == 0;"),
+    "граница «убытка нет» без падения закрытого результата":
+        ("return lossRN == 0 && lossOpenN == 0;", "return lossOpenN == 0;"),
+    # --- правила редакции 9 ------------------------------------------------------------------------------------- #
+    "возврат должника уходит в котёл, а не доплатившим":
+        ("if (x - back != 0) _credit(b, x - back, rb.exiting || rb.payoutMode ? PL_QUEUE : PL_STAKE);",
+         "if (x - back != 0) _credit(treasury, x - back, PL_POT);"),
+    "возврат не возвращает доплатившему реализованный убыток (cum_pnl)":
+        ("rb.cumPnl += x;", ""),
+    "доля возврата счёту пула не гасит shortfall":
+        ("shortfall -= tt;", "tt = 0;"),
+    "прибыль должника не гасит его долг":
+        ("int256 back = _credit(a, _min(_max(0, delta), r.uncovered), PL_DEBT);", "int256 back = 0;"),
+    "депозит гасит долг (ред. 8: деньги из кармана)":
+        ("_credit(a, amt, PL_STAKE); // ред. 9: депозит долг НЕ гасит",
+         "_credit(a, _min(amt, r.uncovered), PL_DEBT); _credit(a, amt - _min(amt, r.uncovered), PL_STAKE);"),
+    "котёл гасит долг пула (ред. 8: котёл — не целиком treasury)":
+        ("            _touch(treasury);\n            rewardCash[treasury] += amount;",
+         "            _touch(treasury);\n            int256 t = _min(amount, shortfall);\n            shortfall -= t;\n            rewardCash[treasury] += amount - t;"),
+    "реферальная доля зачисляется внутри строк, а не после всех":
+        ("            uint256 j = monRefN++; // зачисление — после всех строк (находка CR-1, стенд R6)\n            monRefA[j] = r.referrer;\n            monRefX[j] = ref;",
+         "            _credit(r.referrer, ref, PL_REWARD);"),
+    "доплата соучастников не по весу снимка, а по вместимости":
+        ("int256 wb = b != ai ? snapW[g][order[b]] : int256(0);",
+         "int256 wb = b != ai && snapW[g][order[b]] != 0 ? _ownPlanes(order[b]) - B.paid[b] : int256(0);"),
+    "соучастники не доплачивают: недостача сразу на «весь пул»":
+        ("(got,,, need) = _split(part, B.w, B.cap);", "got = new int256[](n);\n        need = part;"),
+    "_split ред. 9 (быстрый путь, ассемблер): упёршаяся в вместимость доля доливается соседям (второй круг)":
+        [("                    let fl := div(mul(need, wk), W)\n                    dust := sub(dust, fl)\n                    let ck := mload(add(add(cap, 32), o))\n                    if slt(ck, fl) { fl := ck }", "                    let fl := div(mul(need, wk), W)\n                    let ck := mload(add(add(cap, 32), o))\n                    if slt(ck, fl) { fl := ck }\n                    dust := sub(dust, fl)"),
+         ("                    mstore(add(add(give, 32), o), add(g, 1))\n                    mstore(add(add(left, 32), o), sub(mload(add(add(left, 32), o)), 1))\n                    dust := sub(dust, 1)", "                    let y := mload(add(add(left, 32), o))\n                    if slt(dust, y) { y := dust }\n                    mstore(add(add(give, 32), o), add(g, y))\n                    mstore(add(add(left, 32), o), sub(mload(add(add(left, 32), o)), y))\n                    dust := sub(dust, y)")],
+    "_split ред. 9 (широкий путь `_splitWide`): упёршаяся в вместимость доля доливается соседям (второй круг)":
+        [("            dust -= fl;\n            int256 x = _min(cap[k], fl);", "            int256 x = _min(cap[k], fl);\n            dust -= x;"),
+         ("                give[k] += 1;\n                left[k] -= 1;\n                dust -= 1;",
+          "                int256 y = _min(left[k], dust);\n                give[k] += y;\n                left[k] -= y;\n                dust -= y;")],
+    "«весь пул» по капиталу, а не по min(капитал, S)":
+        ("w[b] = _min(basis, S);", "w[b] = basis;"),
+    # «должник с остатком тоже платит "весь пул"» ЭКВИВАЛЕНТЕН: у должника с остатком капитал и заявки уже сняты каскадом его
+    # строки (возврат недели сначала гасит его недостачу), база 0 — веса в разделе у него нет; судить им нечего (замер 09.10)
+    "«весь пул»: база — все деньги, включая «к получению» и вознаграждение":
+        [("monBasis1[cb] = inv[cb].stake + queuedInv[cb] + 1;", "monBasis1[cb] = _ownPlanes(cb) + 1;"),
+         ("int256 basis = s1 != 0 ? s1 - 1 : inv[cb].stake + queuedInv[cb];", "int256 basis = s1 != 0 ? s1 - 1 : _ownPlanes(cb);")],
+    "таблица «весь пул» без добора по порядку регистрации":
+        ("int256 x = _min(rowLeft[d], colLeft[b]);", "int256 x = 0;"),
+    "цепочка: получатель возврата не гасит свой записанный долг":
+        ("int256 back = _credit(b, _min(x, rb.uncovered - fresh), PL_DEBT);", "int256 back = 0;"),
+    "цепочка: погашенное получателем дальше по цепочке не идёт":
+        ("                _pushRepay(b, back); // дальше по цепочке", ""),
+    "возврат не гасит недостачу этой недели у получателя":
+        ("int256 cut = _credit(b, _min(x - back, fresh), PL_DEBT);", "int256 cut = 0;"),
+    "возврат зачисляется по порядку ключей, а не в порядке, в котором `_split` дал долю":
+        ("        for (uint256 t = 0; t < nIns; t++) {\n            uint256 k = ins[t];\n            int256 x = parts[k];",
+         "        for (uint256 k = 0; k <= n; k++) {\n            int256 x = parts[k];\n            if (x == 0) continue;"),
+    "доплата не уменьшает реализованный результат доплатившего (cum_pnl)":
+        ("inv[cb].cumPnl -= x;", ""),
+    # проекции ред. 9.1: hold — верхняя граница, гейт депозита — вся проектная недостача
+    "hold: худшая доля округлена вниз":
+        ("_mulDivUp(c.dAmt[d], wb, rest)", "int256(_mulDiv(uint256(c.dAmt[d]), uint256(wb), uint256(rest)))"),
+    "hold без пыли по поколениям":
+        ("return worst != 0 ? worst + c.dNg[d] : int256(0);", "return worst;"),
+    "hold без доли «весь пул» min(капитал, U)":
+        ("if (c.basis[i] != 0) h += _min(c.basis[i], c.U) + 1;", ""),
+    # «hold не ограничен вместимостью» ЭКВИВАЛЕНТЕН: при hold >= cap = own − PL все потребители уже дают 0 — свободное
+    # stake − PL − fee − hold <= stake − own, вес <= stake − PL <= cap, резерв и `_claimRoom` <= own − PL − hold (замер 09.10)
+    # «вместимость проекции вычитает причитающуюся комиссию (ред. 9)» НЕ ПОЙМАН и ВЕРОЯТНО эквивалентен по потребителям:
+    # вместимость в `hold` — только зажим и фильтр «cap > 0», а там, где они расходятся (own − PL − fee <= 0 < own − PL),
+    # свободное, резерв и забор уже 0. Не доказано: поиск по эталону (40 сценариев debtor + 30 hard, вес/свободное/забор
+    # каждого адреса после каждого вызова) расхождения не нашёл (замер 09.10). Правило перенесено 1:1.
+    "гейт депозита только по признанному долгу (без проектной недостачи)":
+        ("t += _projected(order[i], true, false).uncovered;", "t += 0;"),
+    "вес не уменьшается на hold":
+        ("if (pw != 0) w[i] = _max(0, pw - _holdAt(c, i));", "if (pw != 0) w[i] = _max(0, pw);"),
+    "резерв выплаты не держит hold":
+        ("return _exposureHold(a) + P.pendingLoss + P.feeDue + hold;", "return _exposureHold(a) + P.pendingLoss + P.feeDue;"),
+    "свободное к выводу не держит hold":
+        ("return _max(0, r.stake - P.pendingLoss - P.feeDue - _holdAt(c, uint256(r.regIndex)));",
+         "return _max(0, r.stake - P.pendingLoss - P.feeDue);"),
+    "treasury вправе быть инвестором":
+        ('if (a == treasury) revert Revert("deposit: treasury is not an investor");', ""),
+    # нулевой адрес участником не бывает (эталон `_addr`): фикстуры его не зовут — судят forge-стенды
+    "нулевой адрес принимается везде":
+        ('if (a == address(0)) revert Revert("zero address");', 'if (false) revert Revert("zero address");'),
+    "депозит на нулевой адрес принимается":
+        ("        _addr(a);\n        if (a == treasury) revert", "        if (a == treasury) revert"),
+    # --- фаза 2 пачками: снимок на начало раздела, пачки без пропуска и без повтора ------------------------------------ #
+    "база «всего пула» — текущая, а не снимок на начало раздела":
+        ("int256 basis = s1 != 0 ? s1 - 1 : inv[cb].stake + queuedInv[cb];", "int256 basis = inv[cb].stake + queuedInv[cb];"),
+    "снимок базы «всего пула» берётся ПОСЛЕ снятия доплаты":
+        [("            if (snap && monBasis1[cb] == 0) monBasis1[cb] = inv[cb].stake + queuedInv[cb] + 1;\n", ""),
+         ("            inv[cb].cumPnl -= x;\n",
+          "            inv[cb].cumPnl -= x;\n            if (snap && monBasis1[cb] == 0) monBasis1[cb] = inv[cb].stake + queuedInv[cb] + 1;\n")],
+    "вместимость «всего пула» — снимок базы, а не текущие деньги после соучастников":
+        ("c[b] = _min(basis, _ownPlanes(cb));", "c[b] = basis;"),
+    "вместимость соучастника не уменьшается доплатой внутри пачки":
+        ("            B.cap[b] -= got[b];\n", ""),
+    "пропуск пачки соучастников: курсор перескакивает через должника":
+        ("            kg = 0;\n            d++;", "            kg = 0;\n            d += 2;"),
+    "пропуск пачки таблицы «весь пул»: курсор перескакивает через должника":
+        ("            _tableBatch(monCur, end);\n            monCur = end;",
+         "            _tableBatch(monCur, end);\n            monCur = end < monDebtN ? end + 1 : end;"),
+    "пропуск работы возврата":
+        ("                _repayItem(i++);", "                _repayItem(i);\n                i += 2;"),
+    "двойное применение пачки соучастников: снятие доплат дважды":
+        ("        _payCover(B.paid, true);", "        _payCover(B.paid, true);\n        _payCover(B.paid, true);"),
+    "двойное применение пачки таблицы: добор прежних строк не учтён в остатках столбцов":
+        ("        for (uint256 d = 0; d < from; d++) {\n            _tableGreedy(rowLeft, colLeft, d, row);",
+         "        for (uint256 d = 0; d < 0; d++) {\n            _tableGreedy(rowLeft, colLeft, d, row);"),
+    "двойное применение пачки соучастников: курсор должника не двигается":
+        ("        monCur = d;\n        monGenCur = kg;", "        monGenCur = kg;"),
+    # --- соучастники по единице (должник, поколение убытка): пропуск, повтор, курсор на месте, остаток между пачками -- #
+    "пропуск единицы соучастников: на конце пачки курсор поколения перескакивает через следующую":
+        ("                if (k == 0) break;", "                if (k == 0) {\n                    kg++;\n                    break;\n                }"),
+    "повтор единицы соучастников: на конце пачки курсор поколения возвращается на шаг":
+        ("        monGenCur = kg;", "        monGenCur = kg > 0 ? kg - 1 : kg;"),
+    "курсор единиц соучастников не двигается (ход расчёта стоит)":
+        ("        monUnitsDone = done;", ""),
+    "остаток начатого должника не переживает конец пачки":
+        ("                monMatesR = r;", ""),
+    "mondayStep(0) не отказывает":
+        ('        if (k == 0) revert Revert("mondayStep: k == 0");', ""),
+    # --- буферы фазы 2 со своей длиной и меткой недели ------------------------------------------------------------- #
+    "буфер возвратов не обнуляется в начале расчёта: работы прошлой недели исполняются снова":
+        ("        monRepayN = 0;\n", ""),
+    "позиция должника без метки расчёта: должник прошлого расчёта — должник и этого":
+        ("        return v >> 128 == monEpoch ? v & U128_MAX : 0;", "        return v & U128_MAX;"),
+    # --- поколения и разнесённое без обхода участников ----------------------------------------------------------- #
+    "закрытие ордера не уменьшает число живых ордеров поколения: поколение не закрывается":
+        ("            genLive[g] -= 1;\n            o.notional = 0;", "            o.notional = 0;"),
+    "разнесённое поколения не копится: остаток округлений в котёл неверен":
+        ("        if (sd != 0) shareSum[g] += sd;", ""),
+    # --- ведущиеся суммы адреса по ордерам: писатель обязан снять вклад до изменения и прибавить после ---------------- #
+    "марк: вклад ордера в суммы адресов не снимается до изменения":
+        ("        Order storage o = _order(pid, ST_OPEN);\n        _aggOrder(o, false);\n        _setUpnl(o, _signed(upnl));",
+         "        Order storage o = _order(pid, ST_OPEN);\n        _setUpnl(o, _signed(upnl));"),
+    "отмена ордера не снимает его удержание с адресов":
+        ("        genLive[g] -= 1;\n        _aggOrder(o, false);", "        genLive[g] -= 1;"),
+    "закрытие не сдвигает неразнесённое участников":
+        ("        _moveR(g, r, p0, p1);", "        if (closing) {\n            R[g] += r;\n            rAll += r;\n        } else _moveR(g, r, p0, p1);"),
+    "строка расчёта не обнуляет неразнесённое адреса":
+        ("        if (delta != 0) aggPend[a] = 0;", ""),
+    # --- очередь: полоса сумм по ключу и поиск точки упора -------------------------------------------------------- #
+    # аналог «сжатие очереди не выполнено»: сжатия больше нет, мёртвые записи — те, что за живой границей полосы. Их
+    # отбрасывает новая заявка после снятия хвоста каскадом; без этого конец полосы перестаёт расти и числа расходятся
+    # (судят сценарии `queue_*`). ЭКВИВАЛЕНТНЫ по числам и сняты: «подсказка головы не используется» (поиск даёт тот же
+    # индекс, дороже только газ) и «догадка поиска по id = середина» (ответ поиска от догадки не зависит) — их видит
+    # только бенч газа, дифференциал судит числа.
+    "мёртвые записи за снятым хвостом не отбрасываются перед новой заявкой":
+        ("            if (t + 1 != i || _qEnd(a, reward, t) != L) {", "            if (false) {"),
+    "выплата не сдвигает голову ключа":
+        ("        if (_queuedOf(a, reward) == 0) return;\n        uint256 hd = h.head;",
+         "        if (true) return;\n        uint256 hd = h.head;"),
+    "упор посреди потока: владелец заявки на упоре не получает остаток бюджета":
+        ("            if (S.aHi[k] > x) x += rest;", "            if (false) x += rest;"),
+    "упор: выплачиваемое по ключу не ограничено его `_room`":
+        ("        if (c != 0) amt = _min(S.cap[k], _min(_qEnd(a, S.reward, hd + c - 1), S.L[k]) - S.P[k]);",
+         "        if (c != 0) amt = _min(_qEnd(a, S.reward, hd + c - 1), S.L[k]) - S.P[k];"),
+    "упор: граница по id на единицу дальше (заявка с id = mid считается ниже)":
+        ("            down = e[mid] & Q_ID >= id;", "            down = e[mid] & Q_ID > id;"),
+    # --- ред. 9.2: зачёт циклов книги доплативших и слияние работ возврата (судьи — фикстуры 221-224 и сценарии `cycle_*`) -- #
+    "9.2: без зачёта — доли пишутся в книгу, цикл остаётся":
+        ("                nb = bi + 1;", "                nb = 0;"),
+    "9.2: зачёт не уменьшает долг участников цикла (uncovered)":
+        ("        inv[x].uncovered -= t;\n", ""),
+    "9.2: счёт пула — вершина цикла (a -> b -> пул -> a)":
+        [("                    if (cred[a][b] > 0 && _hasInvDebt(b)) {",
+          "                    if (cred[a][b] > 0 && (_hasInvDebt(b) || credPool[b] > 0)) {"),
+         ("        if (len == 0) return false;",
+          "        if (len == 0) {\n            int256 tp = _min(cred[a][b], credPool[b]);\n            if (tp == 0) return false;\n"
+          "            _credAdd(a, b, bi, -tp);\n            credPool[b] -= tp;\n            shortfall -= tp;\n"
+          "            inv[a].uncovered -= tp;\n            inv[b].uncovered -= tp;\n            return true;\n        }")],
+    "9.2: соседи пути зачёта — от поздних к ранним по регистрации":
+        ("                uint256 bit = nb & (~nb + 1); // младший бит — раньше зарегистрированный сосед",
+         "                uint256 bit = uint256(1) << _log2(nb);"),
+    "9.2: доли одного должника пишутся по регистрации доплативших, а не по адресу":
+        [("        for (uint256 i = m / 2; i > 0; i--) {", "        for (uint256 i = 0; i > 0; i--) {"),
+         ("        for (uint256 end = m; end > 1; end--) {", "        for (uint256 end = 0; end > 1; end--) {")],
+    "9.2: зачёт видит доли раздела, ещё не записанные в книгу":
+        ("        monPend[a][order[b]] += x;\n", "        _credAdd(a, order[b], b, x);\n"),
+    "9.2: без слияния работ возврата":
+        ("            if (v >> 128 == monEpoch && (v & U128_MAX) > i + 1) {", "            if (false) {"),
+    "9.2: слияние и с уже исполненной работой возврата":
+        ("            if (v >> 128 == monEpoch && (v & U128_MAX) > i + 1) {", "            if (v >> 128 == monEpoch) {"),
+    "9.2: позиция работы возврата без метки расчёта":
+        ("            if (v >> 128 == monEpoch && (v & U128_MAX) > i + 1) {", "            if ((v & U128_MAX) > i + 1) {"),
+    "9.2: пачка зачёта теряет начатого доплатившего":
+        ("        monNetB = nb;", "        monNetB = 0;"),
+    "9.2: бит ребра не снимается, когда сумма обнулилась":
+        ("        if ((v0 > 0) != (v1 > 0)) credBits[x][yi >> 8] ^= 1 << (yi & 255);",
+         "        if (v1 > 0) credBits[x][yi >> 8] |= 1 << (yi & 255);"),
+    # раскладка реализаций: контекст `hold` считает PoolLedgerProj, остальные получают его статическим вызовом себя
+    "fallback отдаёт holdCtx() витринам, а не проекциям":
+        ("_delegate(msg.sig == SEL_HOLD_CTX || msg.sig == SEL_WEIGHTS ? projImpl : viewsImpl);",
+         "_delegate(msg.sig == SEL_WEIGHTS ? projImpl : viewsImpl);"),
+    "_holdCtx: быстрый путь «убытка нет» берётся всегда — hold без проекции":
+        ("        if (_noProjectedLoss()) return c;\n        return abi.decode(_projCall(SEL_HOLD_CTX), (HoldCtx));",
+         "        if (true) return c;\n        return abi.decode(_projCall(SEL_HOLD_CTX), (HoldCtx));"),
+    # --- ред. 9.2.1 / 9.2.2: вес видит фазу 2 того же расчёта; гейт по маркам при долге (судьи — фикстуры 240-252) ---
+    "fallback отдаёт weights() витринам, а не проекциям":
+        ("_delegate(msg.sig == SEL_HOLD_CTX || msg.sig == SEL_WEIGHTS ? projImpl : viewsImpl);",
+         "_delegate(msg.sig == SEL_HOLD_CTX ? projImpl : viewsImpl);"),
+    "9.2.1: вес без возврата фазы 2 (откат к 9.2, мутант `none` эталона)":
+        ("return _min(inv[a].stake, P.weight + (ph.any ? ph.stake[i] : int256(0)));", "return _min(inv[a].stake, P.weight);"),
+    "9.2.1: гашение своего долга в весе — из закрытого, не по маркам (`closedback`)":
+        ("int256 net = P.pend - _min(_max(0, P.pend - paperLoss), r.uncovered) - paperLoss;",
+         "int256 net = P.pend - repay - paperLoss;"),
+    "9.2.1: возврат вне вместимости и базы раздела (`nocapmoney`)":
+        ("int256 money = ph.any ? ph.money[i] : int256(0);", "int256 money = 0;"),
+    "9.2.1: режим выплаты и выход игнорируются — возврат всегда в капитал (`money`)":
+        ("if (!M.toQ[b]) ph.stake[b] += rest;", "ph.stake[b] += rest;"),
+    "9.2.1: результат недели черновика — без бумажного убытка (неразнесённое как есть)":
+        ("if (s != 0) d += _attr(s, M.pr[j] + M.pp[j], M.pt[j]) - _attr(s, M.pr[j], M.pt[j]);", ""),
+    "9.2.1: черновик без недостачи недели получателя":
+        ("                short = _max(0, -delta - own);", ""),
+    "9.2.1: граница результата снизу без бумажного убытка (pend вместо pend − aggPL)":
+        ("int256 lo = pend - aggPL[a];", "int256 lo = pend;"),
+    "9.2.1: строка книги в черновике без счёта пула":
+        ("amt[m] = credPool[a];", "amt[m] = 0;"),
+    "9.2.2: возврат целиком в капитал получателя, без цепочки (`nochain`)":
+        ("            back := sub(u, f)\n            if slt(x, back) { back := x }\n", "            back := 0\n"),
+    "9.2.2: недостача получателя возвратом не гасится (`nofresh`)":
+        ("            let cut := f\n            if slt(rest, cut) { cut := rest }\n", "            let cut := 0\n"),
+    "9.2.2: черновик без слияния работ возврата":
+        ("                switch sl\n                case 0 { push := 1 }", "                switch 0\n                case 0 { push := 1 }"),
+    "9.2.2: граница доплаты веса без `cut`":
+        ("int256 short = P.uncovered - (forWeight && ph.any ? ph.cut[i] : int256(0));", "int256 short = P.uncovered;"),
+    "9.2.2: граница доплаты веса — худший порядок гейтов, а не расчёт разом":
+        ("Proj memory P = _projected(a, true, forWeight);", "Proj memory P = _projected(a, true, false);"),
+    "9.2.2: старый гейт — бумажный убыток гасится всей закрытой прибылью должника (`oldgate`)":
+        ("P.pendingLoss += _max(0, paperLoss - (now_ ? _max(0, P.pend) : _max(0, P.pend) - repay));",
+         "P.pendingLoss += _max(0, paperLoss - _max(0, P.pend));"),
+    # --- пакет безопасности (план 2026-10-17-pool-safety-pack, §8 «Бухгалтерия»; судьи — фикстуры 253-255, PoolLedgerTest)
+    "П1: минимум депозита не проверяется":
+        ('if (amt < minDeposit) revert Revert("deposit: below min");', ""),
+    "П1: минимум `<` -> `<=` (ровно минимум отклонён)":
+        ('if (amt < minDeposit) revert Revert("deposit: below min");', 'if (amt <= minDeposit) revert Revert("deposit: below min");'),
+    "П1: минимум только для первого депозита":
+        ('if (amt < minDeposit) revert Revert("deposit: below min");',
+         'if (!inv[a].exists && amt < minDeposit) revert Revert("deposit: below min");'),
+    "П2: предел пропускает при равенстве":
+        ("if (!inv[a].exists && order.length >= maxInvestors)", "if (!inv[a].exists && order.length > maxInvestors)"),
+    "П2: предел отвергает пополнение":
+        ("if (!inv[a].exists && order.length >= maxInvestors)", "if (order.length >= maxInvestors)"),
+    "П3: refundRef не сжигает ref":
+        ("        _start();\n        _burnRef(ref);\n", "        _start();\n        _id32(ref);\n        if (ledgerRef[ref]) revert Revert(\"ledger_ref used\");\n"),
+    "П3: refundRef без _start() (возврат посреди открытого расчёта)":
+        ("        _start();\n        _burnRef(ref);\n", "        _burnRef(ref);\n"),
+    "П2: конструктор принимает предел выше границы газа":
+        ("if (p.maxInvestors == 0 || p.maxInvestors > MAX_INVESTORS_BOUND) revert", "if (p.maxInvestors == 0) revert"),
+    # --- ред. 9.3 / 9.3.1 / 9.3.1.1: частичное закрытие и комиссия с итога сделки (судьи — фикстуры 231-235, 300-303, 310-311
+    # и стенды `PoolLedgerTest.test_rev931_*`; имена эталона — спека 8.12 «Мутанты», 8.12.1 «Мутанты»)
+    "9.3: пропуск разнесения части по поколению — неразнесённое и D участников не видят часть (K8)":
+        ("        _moveR(g, r, p0, p1);", "        if (!closing) {\n            R[g] += r;\n            rAll += r;\n        } else _moveR(g, r, p0, p1);"),
+    "9.3: стоимость счёта не видит часть (K7, `rAll`)":
+        ("        _moveR(g, r, p0, p1);", "        _moveR(g, r, p0, p1);\n        if (!closing) rAll -= r;"),     # ред. 9.5: `rAll` пишет `_moveR`
+    "9.3: новый вклад ордера после части не добавлен (K10)":
+        ("            _aggOrder(o, true);\n            _signed(o.upnl + q1);", "            _signed(o.upnl + q1);"),
+    "9.3: марк остатка не применяется — реализованное посчитано дважды (F7)":
+        ("            _setUpnl(o, _signed(upnl));\n            o.notional = notional;", "            o.notional = notional;"),
+    "9.3: нотионал остатка не применяется":
+        ("            o.notional = notional;\n", ""),
+    "9.3: нотионал остатка, равный прежнему, принят (повтор транзакции удваивает часть)":
+        ("if (n == 0 || n >= o.notional) revert", "if (n == 0 || n > o.notional) revert"),
+    "9.3: нулевой нотионал остатка принят":
+        ("if (n == 0 || n >= o.notional) revert", "if (n >= o.notional) revert"),
+    "9.3.1: комиссия с части до закрытия — часть сразу в базу понедельника (правило 9.3, N1)":
+        ("        (int256 near,) = _feeBase(a, _unrealized(a));", "        int256 near = _min(0, _unrealized(a));"),
+    "9.3.1: резерв — только ближайший понедельник (N4)":
+        ("+ _max(near, res) - r.hwm)", "+ near - r.hwm)"),
+    "9.3.1.1: резерв по формуле 9.3.1 — остаток ордера с частью в плюс в общем бумажном `min` (N7)":
+        ("            rb = o.upnl < 0 ? u : int256(0);\n            ru = -u;", "            rb = 0;\n            ru = 0;"),
+    "9.3.1: резерв — часть в минус не поднимает базу (−доля(p))":
+        ("            rb = -_attr(s, p, T);", "            rb = 0;"),
+    "9.3.1: `partR` в int128 (сумма частей −(2^128 − 2) отвергается)":
+        [("        int256 partR;\n    }", "        int128 partR;\n    }"), ("        o.partR = q1;", "        o.partR = int128(_signed(q1));")],
+    "9.3.1: следующая часть освобождает прежние (K21)":
+        ("int256 q1 = closing ? int256(0) : q0 + r;", "int256 q1 = closing ? int256(0) : r;"),
+    "9.3.1: закрытие не освобождает отложенную базу (N2)":
+        ("int256 q1 = closing ? int256(0) : q0 + r;", "int256 q1 = closing ? q0 : q0 + r;"),
+    "9.3.1: D не ведётся — доля частей открытых ордеров остаётся в базе":
+        ("                if (dd != 0) aggD[a] += dd;", ""),
+    "9.3.1: сумма частей поколения не ведётся (`genP`)":
+        ("        genP[g] = p1;", ""),
+    "9.3.1: счётчик ордеров с частью не ведётся — база считается без частей":
+        ("        if ((q0 != 0) != (q1 != 0)) q1 != 0 ? partOrders++ : partOrders--;", ""),
+    "9.3.1: границы `partR` сняты (N6)":
+        [("        _signed(o.upnl + o.partR); // ред. 9.3.1", "        // ред. 9.3.1"), ("            _signed(o.upnl + q1);\n", ""),
+         ("        _signed(R[g] - p1);\n", "")],
+    # --- ред. 9.4: замороженный пул (спека 8.13, мутанты M1/M3/M6 эталона — стенд AV10; неизменность; MX1) --------- #
+    "9.4 M1: котёл treasury наравне с прочими плоскостями (первая редакция плана)":
+        ("int256 t = _max(0, _min(emFT - emH, M - emF));", "int256 t = (M * emFT) / (E + emFT == 0 ? int256(1) : E + emFT);"),
+    "9.4 M6: возврат к КЕ13 — котёл первым и при дыре пула (без `− H`)":
+        ("int256 t = _max(0, _min(emFT - emH, M - emF));", "int256 t = _max(0, _min(emFT, M - emF));"),
+    "9.4 КЕ13′: котёл не младше чужого «к получению» (без `M − F_o`)":
+        ("int256 t = _max(0, _min(emFT - emH, M - emF));", "int256 t = _max(0, _min(emFT - emH, M));"),
+    "9.4 M3: неразнесённый результат недели в капитале снимка":
+        ("if (inv[a].exists) s = inv[a].stake + queuedInv[a];", "if (inv[a].exists) s = inv[a].stake + queuedInv[a] + aggPend[a];"),
+    "9.4: прибыль — всем плоскостям, а не только капиталу":
+        ("if (S != 0) return base + _mulDiv(uint256(r - E), uint256(s), uint256(S));",
+         "if (S != 0) return base + _mulDiv(uint256(r - E), uint256(f + s), uint256(E));"),
+    "9.4: капитала нет — излишек котлу, а не участникам живых поколений":
+        ("return emP == 0 ? base : base + _mulDiv(uint256(r - E), uint256(_emPart(a)), uint256(emP));", "return base;"),
+    "9.4: убыток округлён вверх (в пользу держателя)":
+        ("if (r <= E) return E == 0 ? 0 : _mulDiv(uint256(r), uint256(f + s), uint256(E));",
+         "if (r <= E) return E == 0 ? 0 : _mulDiv(uint256(r), uint256(f + s), uint256(E)) + 1;"),
+    "9.4: Σ весов P без поколений (участие не считается)":
+        ("        emP = snapTotalSum;", "        emP = 0;"),
+    "9.4: проход итогов считает котёл в F_o":
+        ("            if (a == address(0) || a == treasury) continue;\n            (int256 fa, int256 sa) = _emLive(a);",
+         "            if (a == address(0)) continue;\n            (int256 fa, int256 sa) = _emLive(a);"),
+    "9.4: доли всегда из копии MS_SNAP (и вне расчёта)":
+        ("return emCopy ? (msFv[a], msSv[a]) : _emLive(a);", "return (msFv[a], msSv[a]);"),
+    "9.4: заморозка посреди расчёта берёт живые (полуразнесённые) плоскости":
+        ("        if (mondayOpen) {\n            (emCopy,", "        if (false) {\n            (emCopy,"),
+    "9.4: MS_SNAP не пишет нули — копия прошлой недели остаётся":
+        ("if (copy) (msFv[a], msSv[a]) = (fa, sa);", "if (copy && (fa != 0 || sa != 0)) (msFv[a], msSv[a]) = (fa, sa);"),
+    "9.4: неизменность — `_start` без замка заморозки":
+        ("        if (emState != 0) revert Revert(\"frozen\");\n        if (mondayOpen) revert Revert(\"monday in progress\");",
+         "        if (mondayOpen) revert Revert(\"monday in progress\");"),
+    "9.4: неизменность — шаг расчёта после заморозки посреди него":
+        ("    function mondayStep(uint256) external onlyOwner returns (uint256) {\n        if (emState != 0) revert Revert(\"frozen\");\n",
+         "    function mondayStep(uint256) external onlyOwner returns (uint256) {\n"),
+    "9.4: неизменность — `mondayEnd` после заморозки посреди расчёта":
+        ("    function mondayEnd() external onlyOwner {\n        if (emState != 0) revert Revert(\"frozen\");\n",
+         "    function mondayEnd() external onlyOwner {\n"),
+    "9.4: повторная заморозка принята":
+        ("        if (emState != 0) revert Revert(\"frozen\");\n        initialized = true;", "        initialized = true;"),
+    "MX1: возврат Send после заморозки — ref сгорает":
+        ("        _start();\n        _burnRef(ref);\n", "        _burnRef(ref);\n"),
+    "MX1: `coverShortfall` после заморозки":
+        ("    function coverShortfall(uint256 amount, uint8 path, bytes32 ref) external onlyOwner returns (int256) {\n        _start();\n",
+         "    function coverShortfall(uint256 amount, uint8 path, bytes32 ref) external onlyOwner returns (int256) {\n"),
+    # A9: подъём предела адресов (судья — PoolLedgerTest `test_raise_max_investors_*`, PoolVaultTest)
+    "A9: подъём предела выше границы газа":
+        ("if (n <= maxInvestors || n > MAX_INVESTORS_BOUND) revert", "if (n <= maxInvestors) revert"),
+    "A9: предел можно опустить":
+        ("if (n <= maxInvestors || n > MAX_INVESTORS_BOUND) revert", "if (n > MAX_INVESTORS_BOUND) revert"),
+    "A9: подъём предела не записывается":
+        ("        maxInvestors = n;\n", ""),
+    "A9 × 9.4: подъём предела после заморозки (бухгалтерия обязана быть неизменной целиком)":
+        ("        if (emState != 0) revert Revert(\"frozen\");\n        if (n <= maxInvestors", "        if (n <= maxInvestors"),
+    "A9: подъём предела без прав владельца":
+        ("function raiseMaxInvestors(uint256 n) external onlyOwner {", "function raiseMaxInvestors(uint256 n) external {"),
+    "A10: витрина капитала читает не капитал":
+        ("        return stakeSum;\n", "        return spot;\n"),
+    # пакет A ревью (20.10): исход `withdraw` — кодом (судья — кодек статуса `Ledger.withdraw` на фикстурах)
+    "withdraw: сумма сверх свободной доли не отклоняется":
+        ("if (amt == 0 || amt > free) return (W_AMOUNT, 0, 0);", "if (amt == 0) return (W_AMOUNT, 0, 0);"),
+    "withdraw: бизнес-отказ уходит кодом «исполнено»":
+        ("if (amt == 0 || amt > free) return (W_AMOUNT, 0, 0);", "if (amt == 0 || amt > free) return (W_OK, 0, 0);"),
+    "withdraw: бизнес-отказ — снова отказ транзакции (хранилище не отличит его от нехватки газа)":
+        ("if (amt == 0 || amt > free) return (W_AMOUNT, 0, 0);", "if (amt == 0 || amt > free) revert Revert(\"withdraw: amount\");"),
+    "withdraw: исполненный вывод отдаёт код отказа":
+        ("        return (W_OK, amt - rest, rest);", "        return (W_AMOUNT, amt - rest, rest);"),
+    "withdraw: сумма вне uint128 не судится (знак после приведения)":
+        ("        if (amount > U128_MAX) return (W_RANGE, 0, 0);\n", ""),
+    # пакет A ревью: книга ордеров O(1) — закрытые за неделю в буфере, живые — перестановкой
+    "закрытый ордер остаётся среди живых":
+        ("            _unlistOrder(pid); // из живых", "            // из живых"),
+    "закрытый ордер не попадает в буфер недели (выгрузка теряет его до расчёта)":
+        ("            weekClosed[weekClosedN++] = pid;\n", ""),
+    "буфер закрытых не обнуляется расчётом (закрытые живут в книге вечно)":
+        ("        weekClosedN = 0; // закрытые", "        // закрытые"),
+    "перестановка не переписывает позицию переставленного":
+        ("            orderIx[moved] = i + 1;\n", ""),
+    # «позиция удалённого ордера не стирается» (снять `delete orderIx[pid]`) ЭКВИВАЛЕНТЕН (замер 21.10: краснеет НИ ОДНА
+    # фикстура): позицию читает только `_unlistOrder` живого ордера, а pid снова становится живым лишь через `_listOrder`,
+    # который её переписывает. `delete` оставлен ради возврата газа за слот — судить им нечего
+    "isInvestor: всегда «не инвестор» (хранилище передаст реферал повторно)":
+        ("        return inv[a].exists;\n", "        return false;\n"),
+    # ревью-2, #1 / #3: витрины keeper'а (судья — `Ledger.history_views` на каждом шаге каждой фикстуры)
+    "liveGenCount: счётчик поколений вместо живых":
+        ("        return _snapCount();\n    }\n\n    /// @notice Ред. 9.5: (предел", "        return uint256(gen);\n    }\n\n    /// @notice Ред. 9.5: (предел"),
+    # --- ред. 9.5: амортизация поколений и внеочередной расчёт (спека 8.15) ------------------------------------------- #
+    # Судьи: фикстуры (исход раздела, пыль, котёл), витрина `genLimits()` против выгрузки на КАЖДОМ шаге (живые, с расчёта),
+    # отказ `_finalizeGenerations` на окончательном поколении в списке живых; право на внеочередной расчёт — forge-стенды
+    # `PoolLedgerGensTest` (у фикстур эталона предела нет — условие пусто по построению).
+    "9.5: отмена не закрывает окончательное поколение (счётчики не обновлены в cancel)":
+        ("        _deleteOrder(pid);\n        _maybeDead(g);", "        _deleteOrder(pid);"),
+    "9.5: закрытие не закрывает окончательное поколение (счётчики не обновлены в close)":
+        ("            weekClosed[weekClosedN++] = pid;\n            _maybeDead(g);", "            weekClosed[weekClosedN++] = pid;"),
+    "9.5: sizeOrder не закрывает прежнее текущее поколение без ордеров":
+        ("            if (snapExists[g0] && genLive[g0] == 0) _genDead(g0);", ""),
+    "9.5: текущее поколение считается окончательным (закрывается при последнем ордере)":
+        ("        if (genLive[g] == 0 && g != gen) _genDead(g);", "        if (genLive[g] == 0) _genDead(g);"),
+    "9.5: пыль окончательного поколения не копится до расчёта":
+        ("        dustPending += x - s;", ""),
+    "9.5: R окончательного поколения не уходит в закрытый итог":
+        ("        closedPending += x;", ""),
+    "9.5: окончательное поколение остаётся в списке живых":
+        ("        totalDead += snapTotal[g];\n        _lvRemove(g);", "        totalDead += snapTotal[g];"),
+    "9.5: Σ весов снимков не снимает окончательные поколения расчётом":
+        ("        snapTotalSum -= totalDead;", ""),
+    "9.5: потолок капитала не снимает окончательные поколения расчётом":
+        ("        growSum -= growDead;", ""),
+    "9.5: R поколения не двигает оценку потолка капитала":
+        ("        growSum += _max(0, x1) - _max(0, x0);", ""),
+    "9.5: R поколения не двигает границу «убытка нет»":
+        ("        if ((x0 < y) != (x1 < y)) x1 < y ? lossRN++ : lossRN--;", ""),
+    "9.5: марк не двигает счёт поколений с бумажным убытком":
+        ("        if ((l0 != 0) != (l1 != 0)) l1 != 0 ? lossOpenN++ : lossOpenN--;", ""),
+    "9.5: _settle пропускает должника (недостача без записи в раздел)":
+        ("                _pushDebt(a, short);", ""),
+    "9.5: строка должника не читает его поколения (убыток по поколениям пуст)":
+        ("        monScan = d + 1;\n        monScanK = 0;", "        monScanK = 0;"),
+    "9.5: пары убытка второго должника читаются с начала (смещение не записано)":
+        ("        monDebtOff[d] = monLossN;", ""),
+    "9.5: внеочередной расчёт сдвигает неделю":
+        ("            calNext = cw + 1;\n            week += 1;\n        }\n",
+         "            calNext = cw + 1;\n        }\n        week += 1;\n"),
+    "9.5: расчёт не обнуляет счёт поколений с расчёта":
+        ("        monEpoch += 1;\n        gensSince = 0;", "        monEpoch += 1;"),
+    "9.5: метка расчёта не сдвигается (буферы фазы 2 прошлого расчёта той же недели — свои)":
+        ("        monCal = calendar;\n        monEpoch += 1;", "        monCal = calendar;"),
+    "9.5: предел поколений не судится в sizeOrder":
+        ("            if (maxGens != 0 && gensSince >= maxGens) revert Revert(\"size_order: max_gens\");", ""),
+    "9.5: sizeOrder не считает поколения с расчёта":
+        ("            gensSince += 1;\n", ""),
+    "9.5: право на внеочередной расчёт без условия":
+        ("        if (gensSince >= maxGens / 2) return;\n        if (_projectedShortfall() > shortfall) return;\n        revert Revert(\"monday: extra settle not allowed\");",
+         "        return;"),
+    "9.5: право на внеочередной расчёт без должника по маркам (только предел)":
+        ("        if (_projectedShortfall() > shortfall) return;\n", ""),
+    "9.5: право на внеочередной расчёт без предела (только должник)":
+        ("        if (gensSince >= maxGens / 2) return;\n", ""),
+    "9.5: право на внеочередной расчёт с порогом на всём пределе":
+        ("        if (gensSince >= maxGens / 2) return;", "        if (gensSince >= maxGens) return;"),
+    "9.5: неделя снимка заморозки посреди внеочередного расчёта — на одну меньше":
+        ("        emWeek = mondayOpen && monCal ? week - 1 : week;", "        emWeek = mondayOpen ? week - 1 : week;"),
+    "9.5: конструктор принимает предел выше границы газа":
+        ("        if (p.maxGens > MAX_GENS_BOUND) revert Revert(\"max_gens\");", ""),
+    "страница истории: `from` за концом не насыщается (откат)":
+        ("uint256 k = from >= total ? 0 : (total - from <= n ? total - from : n);",
+         "uint256 k = total - from <= n ? total - from : n;"),
+    "страница истории читается с начала списка, а не с `from`":
+        ("            page[i] = l[from + i];\n", "            page[i] = l[i];\n"),
+    "isClosedPid читает пространство записей леджера":
+        ("        return closedPid[pid];\n", "        return ledgerRef[pid];\n"),
+    "dump() без истории (keeper не видит закрытых)":
+        ("return _dump(closedPidList.length + ledgerRefList.length, true);",
+         "return _dump(closedPidList.length + ledgerRefList.length, false);"),
+    "dumpState() пишет историю мимо выделенного (откат вместо выгрузки)":
+        ("        return _dump(0, false);\n", "        return _dump(0, true);\n"),
+    # ревью-3b: календарный расчёт — не чаще одного за календарную неделю; право внеочередного — после замков (судья —
+    # стенды `test_rv3b_*` в `PoolLedgerGensTest`; фикстуры эталона времени не знают, и харнесс двигает цепь на неделю)
+    "ревью-3b: календарный гейт снят (расчёты подряд в одном блоке: комиссия на пике, срок партнёра)":
+        ("            if (cw < calNext) revert Revert(\"monday: calendar week already settled\");\n", ""),
+    "ревью-3b: календарный гейт не запоминает неделю":
+        ("            calNext = cw + 1;\n", ""),
+    "ревью-3b: два календарных расчёта в неделю":
+        ("            calNext = cw + 1;\n", "            calNext = cw;\n"),
+    "ревью-3b: неделя сменяется в четверг (Unix-эпоха), а не в понедельник 00:00 UTC":
+        ("        return (block.timestamp + 3 days) / 7 days;\n", "        return block.timestamp / 7 days;\n"),
+    "ревью-3b: неделя — сутки":
+        ("        return (block.timestamp + 3 days) / 7 days;\n", "        return (block.timestamp + 3 days) / 1 days;\n"),
+    "ревью-3b: право внеочередного судится до замков (причина «extra settle not allowed» на замороженном пуле)":
+        ("        _start();\n        if (gensSince >= maxGens / 2) return;", "        if (gensSince >= maxGens / 2) return;"),
+}
+
+
+# Хранилище: судья — forge-стенды `PoolVaultTest` (симулятор HyperCore); фикстур у хранилища нет. Образец обязан
+# встречаться в `PoolVault.sol` ровно один раз (судит и selftest C7), иначе мутант устарел.
+VAULT_SOURCE = os.path.join(CONTRACTS, "src", "PoolVault.sol")
+_PAUSE = "if (depositsPaused) revert Paused(); "
+VAULT_MUTANTS = {
+    # заявки при открытом недельном расчёте пачками
+    "processWithdrawals: открытый расчёт не проверяется — заявки съедаются отказом бухгалтерии":
+        ("        if (_mondayOpen()) revert MondayOpen();\n", ""),
+    "открытый расчёт судится не тем полем status() (initialized вместо mondayOpen)":
+        ("status()[11] != 0", "status()[0] != 0"),
+    "ревью-2, #8: пачка заявок `i + n` без насыщения (n = max при nextIntent > 0 — откат)":
+        ("        uint256 end = intents.length - i <= n ? intents.length : i + n;\n",
+         "        uint256 end = i + n;\n        if (end > intents.length) end = intents.length;\n"),
+    # самореферал
+    "register принимает самореферала":
+        ("        if (referrer == msg.sender) revert SelfReferrer();\n", ""),
+    # таймлок: один механизм на admin, keeper, guardian и agent-ключи
+    "исполнение до eta":
+        ("        if (block.timestamp < p.eta) revert TooEarly(p.eta);\n", ""),
+    "исполнение без сверки хеша предложения":
+        ("if (p.hash == bytes32(0) || p.hash != h) revert NotProposed();", "if (p.hash == bytes32(0)) revert NotProposed();"),
+    "исполнение не снимает предложение":
+        ("        if (block.timestamp < p.eta) revert TooEarly(p.eta);\n        delete proposals[kind];",
+         "        if (block.timestamp < p.eta) revert TooEarly(p.eta);"),
+    "перезапись предложения не сдвигает eta":
+        ("        proposals[kind] = Proposal(h, eta);",
+         "        proposals[kind] = Proposal(h, proposals[kind].eta == 0 ? eta : proposals[kind].eta);"),
+    "acceptAdmin чужим адресом":
+        ("_take(P_ADMIN, keccak256(abi.encode(msg.sender)));", "_take(P_ADMIN, proposals[P_ADMIN].hash);"),
+    "proposeAdmin без прав admin":
+        ("function proposeAdmin(address a) external onlyAdmin {", "function proposeAdmin(address a) external {"),
+    "proposeKeeper без прав admin":
+        ("function proposeKeeper(address k) external onlyAdmin {", "function proposeKeeper(address k) external {"),
+    "applyKeeper без прав admin":
+        ("function applyKeeper(address k) external onlyAdmin {", "function applyKeeper(address k) external {"),
+    "proposeGuardian без прав admin":
+        ("function proposeGuardian(address g) external onlyAdmin {", "function proposeGuardian(address g) external {"),
+    "applyGuardian без прав admin":
+        ("function applyGuardian(address g) external onlyAdmin {", "function applyGuardian(address g) external {"),
+    "proposeAgent без прав admin":
+        ("function proposeAgent(uint256 leg, address agent, string calldata name) external onlyAdminKeys {",
+         "function proposeAgent(uint256 leg, address agent, string calldata name) external {"),
+    "applyAgent без прав admin":
+        ("function applyAgent(uint256 leg, address agent, string calldata name) external onlyAdminKeys {",
+         "function applyAgent(uint256 leg, address agent, string calldata name) external {"),
+    "хеш agent-ключа без имени":
+        ("_propose(P_AGENT + leg, keccak256(abi.encode(agent, name)));", "_propose(P_AGENT + leg, keccak256(abi.encode(agent)));"),
+    "предложение agent-ключа одно на обе ноги":
+        ("_propose(P_AGENT + leg, ", "_propose(P_AGENT, "),
+    "applyAgent не запоминает применённый ключ":
+        ("        agents[keccak256(abi.encode(leg, name))] = Agent(agent, false);\n", ""),
+    "cancel: guardian отменяет свою замену":
+        ("(msg.sender != guardian || kind == P_GUARDIAN)", "msg.sender != guardian"),
+    "cancel: guardian не отменяет предложения admin":
+        ("if (msg.sender != admin && (msg.sender != guardian || kind == P_GUARDIAN)) revert NotAdmin();",
+         "if (msg.sender != admin) revert NotAdmin();"),
+    "cancel не снимает предложение":
+        ("        delete proposals[kind];\n        emit ProposalCancelled", "        emit ProposalCancelled"),
+    "applyKeeper не снимает запись об отозванном":
+        ("        keeper = k;\n        delete revokedKeeper;\n    }\n\n    /// @notice Guardian",
+         "        keeper = k;\n    }\n\n    /// @notice Guardian"),
+    "конструктор принимает нулевого guardian":
+        (" || p.guardian == address(0)) revert ZeroAddress();", ") revert ZeroAddress();"),
+    # guardian: только отнимающие действия, сразу; восстановление — admin
+    "отнимающие действия без guardian":
+        ("if (msg.sender != admin && msg.sender != guardian) revert NotAdmin();", "if (msg.sender != admin) revert NotAdmin();"),
+    "отнимающие действия открыты всем":
+        ("modifier onlyPauser() {\n        if (msg.sender != admin && msg.sender != guardian)", "modifier onlyPauser() {\n        if (false)"),
+    "паузу снимает guardian":
+        ("function unpauseDeposits() external onlyAdmin {", "function unpauseDeposits() external onlyPauser {"),
+    "снятие паузы не снимает флаг":
+        ("        depositsPaused = false;", "        depositsPaused = true;"),
+    "revokeKeeper не снимает keeper":
+        ("        keeper = address(0);\n", ""),
+    "revokeKeeper не запоминает отозванного":
+        ("        revokedKeeper = k;\n", ""),
+    "restoreKeeper у guardian":
+        ("function restoreKeeper() external onlyAdmin {", "function restoreKeeper() external onlyPauser {"),
+    "restoreKeeper без отозванного (ставит нулевой)":
+        ("        address k = revokedKeeper;\n        if (k == address(0)) revert NothingToChange();", "        address k = revokedKeeper;"),
+    "revokeAgent только у admin (guardian не может)":
+        ("function revokeAgent(uint256 leg, string calldata name, bytes32 salt) external onlyPauser returns (address r) {",
+         "function revokeAgent(uint256 leg, string calldata name, bytes32 salt) external onlyAdmin returns (address r) {"),
+    "revokeAgent ставит прежний ключ, а не свежий адрес":
+        ("        _addAgent(leg, r, name);\n", "        _addAgent(leg, g.agent, name);\n"),
+    # отзыв свежим адресом (testnet T1(б): известная константа молча не отзывает)
+    "revokeAgent: константа 0xdEaD вместо свежего адреса":
+        ("        g.revoked = true;\n        _addAgent(", "        g.revoked = true;\n        r = address(0xdEaD);\n        _addAgent("),
+    "revokeAgent: адрес замены без счётчика (два отзыва — один адрес)":
+        ("++revokeNonce, salt,", "revokeNonce, salt,"),
+    "revokeAgent: адрес замены без соли (предсказуем до вызова)":
+        ("++revokeNonce, salt,", "++revokeNonce,"),
+    "revokeAgent принимает нулевую соль":
+        ("        if (salt == bytes32(0)) revert ZeroSalt();\n", ""),
+    "событие отзыва без адреса замены":
+        ("emit AgentRevoked(leg, g.agent, name, r);", "emit AgentRevoked(leg, g.agent, name, address(0));"),
+    "agent — Core-пользователь не отклоняется (Core отказал бы молча)":
+        ("        if (PrecompileLib.coreUserExists(agent)) revert AgentIsUser(agent);\n", ""),
+    # отмена висящих заявок ноги
+    "cancelLegOrders: отмена не шлётся":
+        ("        _leg(leg).cancelOrders(assets, oids);\n", ""),
+    "cancelLegOrders только у admin (guardian не может)":
+        ("uint64[] calldata oids) external onlyPauser {", "uint64[] calldata oids) external onlyAdmin {"),
+    "cancelLegOrders открыт всем":
+        ("uint64[] calldata oids) external onlyPauser {", "uint64[] calldata oids) external {"),
+    "cancelLegOrders: длины asset/oid не сверяются":
+        ("if (oids.length == 0 || assets.length != oids.length) revert BadAmount();", "if (oids.length == 0) revert BadAmount();"),
+    "revokeAgent неприменённого имени":
+        ("        if (g.agent == address(0)) revert NothingToChange();\n", ""),
+    "повторный отзыв запрещён (молча отказавший отзыв guardian не повторит)":
+        ("if (g.agent == address(0)) revert NothingToChange();", "if (g.agent == address(0) || g.revoked) revert NothingToChange();"),
+    "restoreAgent у guardian":
+        ("function restoreAgent(uint256 leg, string calldata name) external onlyAdminKeys {",
+         "function restoreAgent(uint256 leg, string calldata name) external onlyPauser {"),
+    "restoreAgent без отзыва":
+        ("        if (!g.revoked) revert NothingToChange();\n", ""),
+    "restoreAgent ставит не отозванный ключ":
+        ("_addAgent(leg, g.agent, name);\n        emit AgentRestored",
+         "_addAgent(leg, address(0xdEaD), name);\n        emit AgentRestored"),
+    # ревью-3, R3-A: agent-ключи ног admin ведёт и после заморозки (судья — `test_review3_*` в `PoolVaultEmergencyTest`)
+    "R3-A: restoreAgent после заморозки отвергается (отзыв guardian'а необратим)":
+        ("function restoreAgent(uint256 leg, string calldata name) external onlyAdminKeys {",
+         "function restoreAgent(uint256 leg, string calldata name) external onlyAdmin {"),
+    "R3-A: proposeAgent после заморозки отвергается (нового ключа не поставить)":
+        ("function proposeAgent(uint256 leg, address agent, string calldata name) external onlyAdminKeys {",
+         "function proposeAgent(uint256 leg, address agent, string calldata name) external onlyAdmin {"),
+    "R3-A: applyAgent после заморозки отвергается (созревший ключ не применить)":
+        ("function applyAgent(uint256 leg, address agent, string calldata name) external onlyAdminKeys {",
+         "function applyAgent(uint256 leg, address agent, string calldata name) external onlyAdmin {"),
+    "R3-A: agent-ключи ног без проверки admin (кто угодно ставит и возвращает ключ)":
+        ("    modifier onlyAdminKeys() {\n        _admin();\n", "    modifier onlyAdminKeys() {\n"),
+    "R3-A: admin-действия без проверки admin (общий `_admin` выпал из `_adminLive`)":
+        ("        _live();\n        _admin();\n", "        _live();\n"),
+    # пауза депозитов
+    "пауза не отклоняет creditDeposit":
+        ("        if (depositsPaused) revert Paused();\n", ""),
+    "пауза отклоняет processWithdrawals":
+        ("revert MondayOpen();", "revert MondayOpen();\n        " + _PAUSE),
+    "пауза отклоняет claim":
+        ("paid = _claim(msg.sender);", _PAUSE + "paid = _claim(msg.sender);"),
+    "пауза отклоняет claimFor":
+        ("return _claim(a);", _PAUSE + "return _claim(a);"),
+    "пауза отклоняет payQueue":
+        ("ledger.payQueue();", _PAUSE + "ledger.payQueue();"),
+    "пауза отклоняет treasuryPayout":
+        ("return ledger.treasuryPayout();", _PAUSE + "return ledger.treasuryPayout();"),
+    "пауза отклоняет атомарный расчёт":
+        ("ledger.monday();", _PAUSE + "ledger.monday();"),
+    "пауза отклоняет расчёт пачками":
+        ("ledger.mondayBegin(calendar);", _PAUSE + "ledger.mondayBegin(calendar);"),
+    # ред. 9.5: внеочередной расчёт хранилищем — тот же расчёт; пауза депозитов его не держит
+    "пауза отклоняет внеочередной расчёт":
+        ("ledger.monday(calendar);", _PAUSE + "ledger.monday(calendar);"),
+    "внеочередной расчёт хранилищем проводится календарным":
+        ("        ledger.monday(calendar);", "        ledger.monday(true);"),
+    "расчёт пачками хранилищем всегда календарный":
+        ("        ledger.mondayBegin(calendar);", "        ledger.mondayBegin(true);"),
+    "нет события внеочередного расчёта":
+        ("        ledger.monday(calendar);\n        _settled();",
+         "        ledger.monday(calendar);\n        if (clock.mondayEndAt != 0) clock.mondayEndAt = uint64(block.timestamp);"),
+    "хранилище связывается с бухгалтерией без предела поколений":
+        ("        if (mg == 0) revert NotLinked(l);", ""),
+    "пауза отклоняет coverShortfall":
+        ("left = ledger.coverShortfall(", _PAUSE + "left = ledger.coverShortfall("),
+    # замок кассы G1
+    "G1 не судится после операций keeper":
+        ("        int256 x = _slackWith(s);\n        if (x < 0) revert VaultSlack(x);\n", "        int256 x = _slackWith(s);\n"),
+    "G1 не судится после claim инвестора":
+        ("        paid = _claim(msg.sender);\n        _assertSlack();\n", "        paid = _claim(msg.sender);\n"),
+    "G1: исходящие блока не вычитаются (фантом Н5)":
+        ("return int256(_coreWei()) - int256(_outPending()) - (s[7]", "return int256(_coreWei()) - (s[7]"),
+    "G1: исходящие блока не копятся (только последняя отправка)":
+        ("        outWei = uint192(cur + w);", "        outWei = uint192(w);"),
+    "G1: исходящие прошлых блоков не гаснут":
+        ("return outBlock == block.number ? outWei : 0;", "return outWei;"),
+    "G1: выплата не отмечается исходящей":
+        ("        _out(uint256(paid) * WEI_PER_MICRO);\n", ""),
+    "G1: раздача на ноги не отмечается исходящей":
+        ("            _out(uint256(move) * WEI_PER_MICRO);\n", ""),
+    "G1: не разнесённый приход с ног не вычитается (Н8)":
+        ("        return _slackOf(s, _unbooked(s));", "        return _slackOf(s, 0);"),
+    "G1: max(0, …) снят — разнесённое сверх пришедшего ослабляет замок":
+        ("        if (u < 0) u = 0;\n", ""),
+    "G1: раздача не уменьшает счётчик ног":
+        ("            legFlow -= move;", "            legFlow -= 0;"),
+    "G1: отправка с ноги считается пришедшей сразу (форма плана до валидации, В1)":
+        ("        windows[leg] = Window(uint64(block.number), usd, b.total, true);",
+         "        windows[leg] = Window(uint64(block.number), usd, b.total, true);\n        legFlow += int256(uint256(usd));"),
+    "притоки: creditDeposit при открытом окне ноги":
+        ("        if (depositsPaused) revert Paused();\n        _assertNoWindows();\n", "        if (depositsPaused) revert Paused();\n"),
+    "притоки: coverShortfall при открытом окне ноги":
+        ("        _assertNoWindows();\n        left = ledger.coverShortfall", "        left = ledger.coverShortfall"),
+    "притоки: окно судится только у первой ноги":
+        ("for (uint256 i = 0; i < 2; i++) {\n            if (windows[i].blockNo != 0) revert LegBusy(i);",
+         "for (uint256 i = 0; i < 1; i++) {\n            if (windows[i].blockNo != 0) revert LegBusy(i);"),
+    # окна переводов ног и подтверждения по кассе ноги
+    "подтверждение в блоке отправки":
+        ("block.number <= w.blockNo", "block.number < w.blockNo"),
+    "подтверждённый приход с ноги не засчитывается":
+        ("if (w.fromLeg == arrived) legFlow +=", "if (!w.fromLeg && !arrived) legFlow +="),
+    "отказ раздачи не засчитывается как пришедшее с ног":
+        ("if (w.fromLeg == arrived) legFlow +=", "if (w.fromLeg && arrived) legFlow +="),
+    "судья отправки с ноги: неизменная касса = пришло":
+        ("w.fromLeg ? nowWei < w.before :", "w.fromLeg ? nowWei <= w.before :"),
+    "судья раздачи: любой рост кассы = пришло":
+        ("nowWei >= uint256(w.before) + uint256(w.amount) * WEI_PER_MICRO", "nowWei >= uint256(w.before)"),
+    "окно не закрывается подтверждением":
+        ("        delete windows[leg];\n", ""),
+    "confirmLegSend принимает окно раздачи":
+        ("        if (!windows[leg].fromLeg) revert NoWindow(leg);\n", ""),
+    "legSendToVault сверх кассы ноги":
+        ("if (usd == 0 || uint256(usd) * WEI_PER_MICRO > b.total - b.hold) revert BadAmount();", "if (usd == 0) revert BadAmount();"),
+    "legSendToVault при открытом окне ноги":
+        ("        _legFree(leg);\n        PrecompileLib.SpotBalance memory b = _legSpot(leg);",
+         "        PrecompileLib.SpotBalance memory b = _legSpot(leg);"),
+    "окно ноги не видит перевод perp <-> spot того же блока":
+        ("windows[leg].blockNo != 0 || legActBlock[leg] == block.number", "windows[leg].blockNo != 0"),
+    "legToPerp при открытом окне":
+        ("function legToPerp(uint256 leg, uint64 usd) external onlyKeeper {\n        if (windows[leg].blockNo != 0) revert LegBusy(leg);\n",
+         "function legToPerp(uint256 leg, uint64 usd) external onlyKeeper {\n"),
+    "legToSpot при открытом окне":
+        ("function legToSpot(uint256 leg, uint64 usd) external onlyKeeper {\n        if (windows[leg].blockNo != 0) revert LegBusy(leg);\n",
+         "function legToSpot(uint256 leg, uint64 usd) external onlyKeeper {\n"),
+    "legToPerp не отмечает блок перевода":
+        ("        legActBlock[leg] = uint64(block.number);\n        _leg(leg).toPerp(usd);", "        _leg(leg).toPerp(usd);"),
+    "legToSpot не отмечает блок перевода":
+        ("        legActBlock[leg] = uint64(block.number);\n        _leg(leg).toSpot(usd);", "        _leg(leg).toSpot(usd);"),
+    "sweepToLegs при занятой ноге":
+        ("        _legFree(0);\n        _legFree(1);\n", ""),
+    "sweepToLegs не открывает окно":
+        ("        windows[leg] = Window(uint64(block.number), uint64(micro), _legSpot(leg).total, false);\n", ""),
+    # выплата только держателю
+    "выплата уходит не держателю":
+        ("CoreWriterLib.spotSend(a, USDC, uint64(uint256(paid) * WEI_PER_MICRO));",
+         "CoreWriterLib.spotSend(keeper, USDC, uint64(uint256(paid) * WEI_PER_MICRO));"),
+    # получатель обязан быть на Core (комиссия активации мимо бухгалтерии)
+    "выплата без проверки активации получателя":
+        ("        _activated(a);\n        paid = ledger.claim(a);", "        paid = ledger.claim(a);"),
+    "раздача без проверки активации ноги":
+        ("        _activated(address(_leg(leg)));\n", ""),
+    # G2: ликвидность не больше физической
+    "G2 на открытии расчёта пачками снят":
+        ("        _assertWithdrawable(uint256(s[10]), s);\n", ""),
+    "G2 снят":
+        ("        if (amount > phys) revert WithdrawableAbovePhysical(amount, phys);\n", ""),
+    "G2 без spot ног":
+        ("phys += PrecompileLib.withdrawable(l) + (b.total - b.hold) / WEI_PER_MICRO;", "phys += PrecompileLib.withdrawable(l);"),
+    "G2 без perp ног":
+        ("phys += PrecompileLib.withdrawable(l) + (b.total - b.hold) / WEI_PER_MICRO;", "phys += (b.total - b.hold) / WEI_PER_MICRO;"),
+    "G2 без не разнесённого прихода с ног":
+        ("phys = uint256(_unbooked(s));", "phys = 0;"),
+    # депозит на perp хранилища
+    "vaultToSpot переводит в perp":
+        ("CoreWriterLib.transferUsdClass(usd, false);", "CoreWriterLib.transferUsdClass(usd, true);"),
+    "vaultToSpot без сверки с выводимым perp":
+        ("if (usd == 0 || usd > PrecompileLib.withdrawable(address(this))) revert BadAmount();", "if (usd == 0) revert BadAmount();"),
+    # C7: раздача ногам с долей
+    "раздача: доля игнорируется (50/50)":
+        ("uint256 toA = uint256(move) * legShareBps / BPS;", "uint256 toA = uint256(move) / 2;"),
+    "раздача: остаток округления теряется (нога B — тоже по доле)":
+        ("_sendToLeg(1, uint256(move) - toA);", "_sendToLeg(1, uint256(move) * (BPS - legShareBps) / BPS);"),
+    "раздача: нога с нулевой долей получает окно и проверку активации":
+        ("        if (micro == 0) return;\n", ""),
+    "доля ноги без таймлока (applyLegShare без предложения)":
+        ("        _take(P_SHARE, keccak256(abi.encode(bpsA)));\n", ""),
+    "доля ноги выше 100 % при предложении":
+        ("        if (bpsA > BPS) revert BadAmount();\n        _propose(P_SHARE", "        _propose(P_SHARE"),
+    "доля ноги выше 100 % в конструкторе":
+        ("        if (p.legShareBps > BPS) revert BadAmount();\n", ""),
+    "applyLegShare без прав admin":
+        ("function applyLegShare(uint256 bpsA) external onlyAdmin {", "function applyLegShare(uint256 bpsA) external {"),
+    "applyLegShare не записывает долю":
+        ("        legShareBps = bpsA;\n        emit LegShareSet", "        emit LegShareSet"),
+    # A6 / П5: одна открытая заявка, «вывести всё», проверка при подаче
+    "вторая заявка при открытой":
+        ("        if (openIntent[msg.sender]) revert IntentOpen();\n", ""),
+    "openIntent не ставится при подаче":
+        ("        openIntent[msg.sender] = true;\n", ""),
+    "openIntent не снимается обработкой":
+        ("            _processOne(i, it);\n            delete openIntent[it.addr];", "            _processOne(i, it);"),
+    "openIntent не снимается при отказе бухгалтерии":
+        ("            _processOne(i, it);\n            delete openIntent[it.addr];",
+         "            if (_processOne(i, it)) delete openIntent[it.addr];"),
+    "ALL не подставляет свободную сумму":
+        ("            amt = f > 0 ? uint256(f) : 0;", "            f;"),
+    "«всё» не переводится в служебное значение":
+        ("        if (withdrawAll) amount = ALL;\n", ""),
+    "«всё» с ненулевой суммой":
+        ("if (withdrawAll ? amount != 0 : amount == 0) revert BadAmount();", "if (!withdrawAll && amount == 0) revert BadAmount();"),
+    "подача без проверки свободной доли":
+        ("if (free <= 0 || amount > uint256(free)) revert AboveFree(amount, free);", "free;"),
+    "подача сверх свободного (проверяется только не-держатель)":
+        ("if (free <= 0 || amount > uint256(free)) revert AboveFree(amount, free);", "if (free <= 0) revert AboveFree(amount, free);"),
+    # §4.2 намерений (пакет A ревью, 20.10): бухгалтерия без `try`, бизнес-отказ — кодом. Судьи — сканы газа
+    # `test_nested_*`, заглушки `test_gas_starved_*` и `test_withdraw_status_codes_map_to_events`.
+    "§4.2: withdraw снова под try (нехватка газа во вложенной проекции съедает заявку)":
+        ("        (uint8 st, int256 paid, int256 queued) = ledger.withdraw(it.addr, amt, it.reward);\n",
+         "        (uint8 st, int256 paid, int256 queued) = (1, 0, 0);\n"
+         "        try ledger.withdraw(it.addr, amt, it.reward) returns (uint8 s_, int256 p_, int256 q_) { (st, paid, queued) = (s_, p_, q_); } catch {}\n"),
+    "§4.2: freeStake («всё») снова под try — голодный вызов уходит нулём и отказом":
+        ("            int256 f = PoolLedgerViews(address(ledger)).freeStake(it.addr, it.reward);\n",
+         "            int256 f;\n            try PoolLedgerViews(address(ledger)).freeStake(it.addr, it.reward) returns (int256 x) { f = x; } catch {}\n"),
+    "§4.2: код отказа не проверяется — отказ уходит событием исполнения":
+        ("        done = st == 0;\n", "        done = true;\n"),
+    "§4.2: неизвестный код отказа проходит молча":
+        ("            if (st > 2) revert BadAmount();\n", ""),
+    "§4.2: код 2 (вне uint128) назван отказом суммы":
+        ('st == 1 ? "withdraw: amount" : "uint128"', '"withdraw: amount"'),
+    # находка ревью: «первый ли депозит» — дешёвая витрина бухгалтерии
+    "первый депозит — всегда (реферал передаётся с каждым пополнением)":
+        ("        bool first = !_old(a);", "        bool first = true;"),
+    # ревью-3, R3-I: регистрация после первого депозита — отказ, а не молчаливая запись
+    "R3-I: register после первого депозита проходит (режим выплат молча не меняется)":
+        ("if (prefs[msg.sender].set || _old(msg.sender)) revert AlreadyRegistered();",
+         "if (prefs[msg.sender].set) revert AlreadyRegistered();"),
+    "R3-I: «первый депозит» — всегда (register не видит депозита, creditDeposit передаёт реферал повторно)":
+        ("        return PoolLedgerViews(address(ledger)).isInvestor(a);\n", "        return false;\n"),
+    # ревью-3, R3-B: сверка keeper'а не читает прекомпайлы ноги не на Core (судья — `test_review3_reconcile_*`)
+    "R3-B: reconcile читает прекомпайлы ноги не на Core":
+        ("            if (!PrecompileLib.coreUserExists(address(l))) continue;\n", ""),
+    "R3-B: reconcile видит одну ногу":
+        ("        uint256 spotWei;\n        for (uint256 i = 0; i < 2; i++) {",
+         "        uint256 spotWei;\n        for (uint256 i = 0; i < 1; i++) {"),
+    "R3-B: reconcile без perp-стоимости ног":
+        ("            legsMicro += l.accountValue();\n", ""),
+    "R3-B: reconcile делит spot ноги на микро по ноге (теряет остаток суммы)":
+        ("            spotWei += l.spotUsdcWei();\n",
+         "            legsMicro += int256(uint256(l.spotUsdcWei()) / WEI_PER_MICRO);\n"),
+    # F2 ревью: U_s — излишек без обрезки не разнесённого с ног (судья — `test_f2_*`)
+    "U_s: не разнесённое с ног обрезано нулём (чужой Send уходит держателям, F2)":
+        ("        return _slackOf(s, legFlow + s[9]);", "        return _slackOf(s, _unbooked(s));"),
+    # сторож (W7/W9): частичное закрытие — событием
+    "reducePosition без события":
+        ("        emit PositionReduced(pid, realized, notional, upnl);\n", ""),
+    "PositionReduced несёт не тот нотионал":
+        ("        emit PositionReduced(pid, realized, notional, upnl);", "        emit PositionReduced(pid, realized, 0, upnl);"),
+    # A10: лимит TVL — капитал + депозит
+    "TVL: граница `<=` -> `<` (ровно лимит отклонён)":
+        ("if (capital > tvlCap) revert TvlCapExceeded", "if (capital >= tvlCap) revert TvlCapExceeded"),
+    "TVL: депозит не входит в меру":
+        ("uint256 capital = uint256(PoolLedgerViews(address(ledger)).totalStake()) + amount;",
+         "uint256 capital = uint256(PoolLedgerViews(address(ledger)).totalStake());"),
+    "TVL: лимит не проверяется":
+        ("        if (capital > tvlCap) revert TvlCapExceeded(capital, tvlCap);\n", ""),
+    # A9: подъём предела адресов под таймлоком
+    "applyMaxInvestors без таймлока":
+        ("        _take(P_LIMIT, keccak256(abi.encode(n)));\n", ""),
+    "applyMaxInvestors не поднимает предел бухгалтерии":
+        ("        ledger.raiseMaxInvestors(n);\n", ""),
+    "proposeMaxInvestors без прав admin":
+        ("function proposeMaxInvestors(uint256 n) external onlyAdmin {", "function proposeMaxInvestors(uint256 n) external {"),
+    "applyMaxInvestors без прав admin":
+        ("function applyMaxInvestors(uint256 n) external onlyAdmin {", "function applyMaxInvestors(uint256 n) external {"),
+    "предел и доля — один вид предложения":
+        ("    uint256 internal constant P_LIMIT = 6;", "    uint256 internal constant P_LIMIT = 5;"),
+    # события для сторожа
+    "нет события покрытия недостачи":
+        ("        emit ShortfallCovered(amount, ledgerRef);\n", ""),
+    "событие размера ордера без недели":
+        ("emit OrderSized(pid, notional, gen, _week());", "emit OrderSized(pid, notional, gen, 0);"),
+    "нет события исполнения ордера":
+        ("        emit OrderFilled(pid);\n", ""),
+    "нет события отмены ордера":
+        ("        emit OrderCancelled(pid);\n", ""),
+    "нет события марка":
+        ("        emit PositionMarked(pid, upnl);\n", ""),
+    "нет события закрытия":
+        ("        emit PositionClosed(pid, realized);\n", ""),
+    "нет события ликвидности":
+        ("        emit WithdrawableSet(amount);\n", ""),
+    "нет события расчёта недели пачками":
+        ("        ledger.mondayEnd();\n        _settled();",
+         "        ledger.mondayEnd();\n        if (clock.mondayEndAt != 0) clock.mondayEndAt = uint64(block.timestamp);"),
+    "нет события атомарного расчёта недели":
+        ("        ledger.monday();\n        _settled();",
+         "        ledger.monday();\n        if (clock.mondayEndAt != 0) clock.mondayEndAt = uint64(block.timestamp);"),
+    "возврат: событие с чужим токеном (сигнатура сторожа)":
+        ("emit DepositRefunded(to, USDC, amountWei, ledgerRef, reason);", "emit DepositRefunded(to, 1, amountWei, ledgerRef, reason);"),
+    "vaultToSpot без прав keeper":
+        ("function vaultToSpot(uint64 usd) external onlyKeeper {", "function vaultToSpot(uint64 usd) external {"),
+    # лимит TVL: мера — капитал + депозит (A10, мутанты выше); права
+    "setTvlCap без прав admin":
+        ("function setTvlCap(uint256 cap) external onlyAdmin {", "function setTvlCap(uint256 cap) external {"),
+    # КЕ10: части деплоятся до хранилища на его вычисленный адрес — связность судит конструктор хранилища
+    "конструктор не сверяет владельца бухгалтерии":
+        ("        if (owner != address(this)) revert NotLinked(l);\n", ""),
+    "конструктор принимает бухгалтерию без кода":
+        ("        if (l.code.length == 0) revert NotLinked(l);\n", ""),
+    "конструктор принимает одну ногу на оба места":
+        ("        if (address(p.legA) == address(p.legB)) revert NotLinked(address(p.legB));\n", ""),
+    "конструктор не сверяет хранилище ноги":
+        (" || legs[i].vault() != address(this)) revert NotLinked", ") revert NotLinked"),
+    "конструктор принимает ногу без кода":
+        ("if (address(legs[i]).code.length == 0 || legs[i].vault()", "if (legs[i].vault()"),
+    "конструктор сверяет только ногу A":
+        ("for (uint256 i = 0; i < 2; i++) {\n            if (address(legs[i])", "for (uint256 i = 0; i < 1; i++) {\n            if (address(legs[i])"),
+    # П3 / V3 пакета безопасности: возврат незачтённого Send отправителю (решение 18.10)
+    "возврат без сжигания ref в бухгалтерии":
+        ("        ledger.refundRef(ledgerRef);\n", ""),
+    "возврат не учитывает исходящие блока (outPending)":
+        ("        CoreWriterLib.spotSend(to, USDC, amountWei);\n        _out(amountWei);\n",
+         "        CoreWriterLib.spotSend(to, USDC, amountWei);\n"),
+    "возврат при открытом окне ноги":
+        ("    function refundDeposit(address to, uint64 amountWei, bytes32 ledgerRef, uint8 reason) external onlyKeeper {\n        _assertNoWindows();\n",
+         "    function refundDeposit(address to, uint64 amountWei, bytes32 ledgerRef, uint8 reason) external onlyKeeper {\n"),
+    "возврат на хранилище или его ноги":
+        ("if (to == address(0) || _sink(to)) revert BadRecipient(to);", "if (to == address(0)) revert BadRecipient(to);"),
+    "ревью 20.10, R7: G2 читает прекомпайлы ноги не на Core":
+        ("            if (!PrecompileLib.coreUserExists(l)) continue;\n", ""),
+    "ревью 20.10, F3: нога или хранилище — реферал (двойной счёт в аварии)":
+        ("        if (_sink(referrer)) revert BadRecipient(referrer);", ""),
+    "возврат неактивированному адресу (комиссия активации — на хранилище)":
+        ("        if (amountWei == 0) revert BadAmount();\n        _activated(to);\n", "        if (amountWei == 0) revert BadAmount();\n"),
+    "возврат нулевой суммы":
+        ("        if (amountWei == 0) revert BadAmount();\n        _activated(to);\n", "        _activated(to);\n"),
+    "возврат без прав keeper'а":
+        ("bytes32 ledgerRef, uint8 reason) external onlyKeeper {", "bytes32 ledgerRef, uint8 reason) external {"),
+    "пауза отклоняет и возврат":
+        ("    function refundDeposit(address to, uint64 amountWei, bytes32 ledgerRef, uint8 reason) external onlyKeeper {\n        _assertNoWindows();\n",
+         "    function refundDeposit(address to, uint64 amountWei, bytes32 ledgerRef, uint8 reason) external onlyKeeper {\n        if (depositsPaused) revert Paused();\n        _assertNoWindows();\n"),
+    # ред. 9.3: частичное закрытие — вход keeper'а (судья — `test_reduce_position_keeper_only_and_reaches_ledger`)
+    "reducePosition без прав keeper'а":
+        ("int256 realized, uint256 notional, int256 upnl) external onlyKeeper {", "int256 realized, uint256 notional, int256 upnl) external {"),
+    "reducePosition теряет марк остатка":
+        ("ledger.reducePosition(pid, realized, notional, upnl);", "ledger.reducePosition(pid, realized, notional, 0);"),
+    # ред. 9.4: вход аварии в хранилище — замок после заморозки (MX1, В8) и часы триггеров (судья — `PoolVaultEmergencyTest`)
+    "9.4: keeper работает после заморозки (MX1: возврат, приток, ноги)":
+        ("    function _keeperLive() internal view {\n        _live();\n", "    function _keeperLive() internal view {\n"),
+    "9.4: admin правит после заморозки (В8)":
+        ("    function _adminLive() internal view {\n        _live();\n", "    function _adminLive() internal view {\n"),
+    "9.4: смена admin принимается после заморозки":
+        ("    function acceptAdmin() external {\n        _live();\n", "    function acceptAdmin() external {\n"),
+    "9.4: заявка после заморозки (в том числе «всё»)":
+        ("        _live();\n        if (openIntent[msg.sender]) revert IntentOpen();",
+         "        if (openIntent[msg.sender]) revert IntentOpen();"),
+    "9.4: регистрация после заморозки":
+        ("        _live();\n        if (prefs[msg.sender].set || _old(msg.sender)) revert AlreadyRegistered();",
+         "        if (prefs[msg.sender].set || _old(msg.sender)) revert AlreadyRegistered();"),
+    # «не тот байт» слова эквивалентен: рядом с состоянием лежит номер триггера, он у замороженного пула не ноль
+    "9.4: замок читает не тот слот (раскладка модуля разошлась с хранилищем)":
+        ("            w := sload(slot)", "            w := sload(add(slot, 1))"),
+    "9.4: T_dead не перезапускается операцией keeper'а":
+        ("        c.keeperAt = uint64(block.timestamp);\n", ""),
+    "9.4: журнал рождения заявок бухгалтерии не ведётся (В7′ слеп)":
+        ("            qStamps.push((uint256(c.qSeen) << 64) | block.timestamp);\n", ""),
+    "9.4: открытие расчёта не отмечено (T_stuck слеп)":
+        ("        clock.mondayBeganAt = uint64(block.timestamp);\n", ""),
+    "9.4: закрытый расчёт не перезапускает T_nomonday":
+        ("        if (clock.mondayEndAt != 0) clock.mondayEndAt = uint64(block.timestamp);\n", ""),
+    "ревью 20.10: расчёт пула без денег запускает часы аварии (R6)":
+        ("        if (clock.mondayEndAt != 0) clock.mondayEndAt = uint64(block.timestamp);\n",
+         "        clock.mondayEndAt = uint64(block.timestamp);\n"),
+    "9.4: первый депозит не запускает часы пула":
+        ("        if (clock.mondayEndAt == 0) clock.mondayEndAt = uint64(block.timestamp);", ""),
+    "9.4: время заявки не записано (T_serve слеп)":
+        ("        intentAt[id] = uint64(block.timestamp);\n", ""),
+    "ревью 20.10: созревшее объявление аварии снимается отменой (R5)":
+        ("        if (kind == P_EMERGENCY) _announcementOpen();\n", ""),
+    "ревью 20.10: созревшее объявление аварии перевзводится admin'ом (R5)":
+        ("        _announcementOpen();\n        _propose(P_EMERGENCY, EMERGENCY_HASH);",
+         "        _propose(P_EMERGENCY, EMERGENCY_HASH);"),
+    "ревью 20.10: объявление созревает «навсегда» — отмена запрещена и до eta":
+        ("        if (p.hash != bytes32(0) && block.timestamp >= p.eta) revert Matured(p.eta);",
+         "        if (p.hash != bytes32(0)) revert Matured(p.eta);"),
+    "9.4: объявление аварии без прав admin":
+        ("    function proposeEmergency() external onlyAdmin {", "    function proposeEmergency() external {"),
+    "9.4: конструктор принимает модуль со сроком короче таймлока":
+        (" || p.emergency.minTerm() < 2 * p.delay) revert NotLinked(e);", ") revert NotLinked(e);"),
+    "ревью-2, #5: сроки аварии сверяются с одним DELAY, а не с 2·DELAY":
+        ("p.emergency.minTerm() < 2 * p.delay)", "p.emergency.minTerm() < p.delay)"),
+    "ревью-2, #5: таймлок короче суток принимается":
+        ("        if (p.delay < MIN_DELAY) revert BadDelay(p.delay);\n", ""),
+    "ревью-2, #5: граница таймлока на секунду строже (ровно сутки отклонены)":
+        ("if (p.delay < MIN_DELAY)", "if (p.delay <= MIN_DELAY)"),
+}
+
+# Модуль аварии хранилища (ред. 9.4): мутанты M2/M4/M5 эталона в форме контракта (стенд AV10, AV5) и триггеры. Судья тот же —
+# forge-стенды `PoolVault(Emergency)Test`; образец обязан встречаться в `PoolVaultEmergency.sol` ровно один раз (C7c).
+VAULT_EM_SOURCE = os.path.join(CONTRACTS, "src", "PoolVaultEmergency.sol")
+VAULT_EM_MUTANTS = {
+    "9.4 M2: двойная раздача — знак `outPending` плана (В4)":
+        ("PrecompileLib.spotBalance(address(this), USDC).total)) - int256(out)",
+         "PrecompileLib.spotBalance(address(this), USDC).total)) + int256(out)"),
+    "9.4 M4: доли от текущего баланса — без `paidTotal`, порядок забирания влияет":
+        ("            + int256(st.paidTotal * WEI_PER_MICRO) - int256(st.foreign);", "            - int256(st.foreign);"),
+    "9.4: чужой незачтённый Send (U_s) раздаётся держателям":
+        ("            + int256(st.paidTotal * WEI_PER_MICRO) - int256(st.foreign);",
+         "            + int256(st.paidTotal * WEI_PER_MICRO);"),
+    "9.4 M5: деньги в пути — окна ног прежних блоков не подтверждаются, приход с ног уходит в U_s":
+        ("            if (fromLeg) V.confirmLegSend(i);\n            else V.confirmSweep();\n", ""),
+    "9.4: окно ТЕКУЩЕГО блока подтверждается (заморозка откатывается)":
+        ("            if (b == 0 || b >= block.number) continue;", "            if (b == 0) continue;"),
+    "9.4: выплата не на адрес держателя, а вызывающему":
+        ("        CoreWriterLib.spotSend(a, USDC, uint64(w));", "        CoreWriterLib.spotSend(msg.sender, USDC, uint64(w));"),
+    "9.4: выплаченное адресу не запоминается — забирание повторяется":
+        ("        st.paid[a] = due;\n", ""),
+    "9.4: выплата адресу не на Core (комиссия активации — на хранилище)":
+        ("        if (!PrecompileLib.coreUserExists(a)) revert NotActivated(a);\n", ""),
+    "ревью 20.10, F3: аварийная выплата на ногу/хранилище (вернётся сбором и посчитается дважды)":
+        ("        if (poolSink(a, address(this), address(V.legA()), address(V.legB()), address(V.ledger()))) {\n"
+         "            revert BadRecipient(a);\n        }\n", ""),
+    "ревью 20.10: системные адреса токенов Core (`0x20…`) не в наборе":
+        ("a == ledger || uint160(a) >> 64 == uint160(0x20) << 88", "a == ledger"),
+    "ревью 20.10: системный адрес HYPE (`0x2222…`) не в наборе":
+        ("\n        || a == 0x2222222222222222222222222222222222222222;", ";"),
+    "ревью 20.10: бухгалтерия не в наборе":
+        ("a == legB || a == ledger ||", "a == legB ||"),
+    "ревью 20.10, R7: сбор читает прекомпайлы ноги не на Core":
+        ("        if (!PrecompileLib.coreUserExists(address(l))) {\n            emit EmergencyCollected(leg, 0, 0);\n"
+         "            return;\n        }\n", ""),
+    "9.4: заморозка без триггера":
+        ("        if (why == 0) revert NoTrigger();\n", ""),
+    "9.4: хранилище замораживается, бухгалтерия — нет":
+        ("        V.ledger().emergencyFreeze();\n", ""),
+    "9.4: T_stuck на секунду позже (`>=` -> `>`)":
+        ("now_ >= c.mondayBeganAt + T_STUCK", "now_ > c.mondayBeganAt + T_STUCK"),
+    "ревью 20.10: T_stuck и на пуле без денег (расчёт, открытый до первого депозита)":
+        ("        if (started && s[11] != 0 && c.mondayBeganAt != 0", "        if (s[11] != 0 && c.mondayBeganAt != 0"),
+    "9.4: T_dead и на пуле без денег (любой запирает незапущенный пул)":
+        ("        bool started = c.mondayEndAt != 0;", "        bool started = true;"),
+    "9.4: T_nomonday на секунду позже":
+        ("now_ >= c.mondayEndAt + T_NOMONDAY", "now_ > c.mondayEndAt + T_NOMONDAY"),
+    "9.4: T_serve по заявке хранилища на секунду позже":
+        ("now_ >= oldestIntentAt + T_SERVE", "now_ > oldestIntentAt + T_SERVE"),
+    "ревью 20.10: В7′ снова с условием ликвидности — удержание кассы ног (hold) прячет заявку навсегда (R3)":
+        ("        return now_ >= uint64(V.qStamps(lo)) + T_QUEUE_MAX;",
+         "        return now_ >= uint64(V.qStamps(lo)) + T_QUEUE_MAX\n"
+         "            && uint256(PoolLedgerViews(address(V.ledger())).status()[10]) < V.physicalWithdrawable();"),
+    "ревью 20.10: В7′ прежней формы (T_serve + ликвидность) — донат 1 микро на ногу замораживает пул (R1/F1)":
+        ("        return now_ >= uint64(V.qStamps(lo)) + T_QUEUE_MAX;",
+         "        return now_ >= uint64(V.qStamps(lo)) + T_SERVE\n"
+         "            && uint256(PoolLedgerViews(address(V.ledger())).status()[10]) < V.physicalWithdrawable();"),
+    "ревью 20.10: В7′ по сроку T_serve вместо T_queue_max":
+        ("        return now_ >= uint64(V.qStamps(lo)) + T_QUEUE_MAX;", "        return now_ >= uint64(V.qStamps(lo)) + T_SERVE;"),
+    "ревью 20.10: T_queue_max на секунду позже (`>=` -> `>`)":
+        ("        return now_ >= uint64(V.qStamps(lo)) + T_QUEUE_MAX;", "        return now_ > uint64(V.qStamps(lo)) + T_QUEUE_MAX;"),
+    "ревью 20.10: T_queue_max не сверяется с таймлоком (`minTerm` без него)":
+        ("        if (T_QUEUE_MAX < m) m = T_QUEUE_MAX;\n", ""),
+    "9.4: объявление admin'а до eta":
+        ("if (h == EMERGENCY_HASH && now_ >= eta) return W_ANNOUNCED;", "if (h == EMERGENCY_HASH) return W_ANNOUNCED;"),
+    "9.4 × rev9: объявление аварии — вид доли ног (5): предложения затирают друг друга":
+        ("uint256 constant P_EMERGENCY = 7;", "uint256 constant P_EMERGENCY = 5;"),
+    "9.4 × rev9: объявление аварии — вид предела адресов (6)":
+        ("uint256 constant P_EMERGENCY = 7;", "uint256 constant P_EMERGENCY = 6;"),
+    "9.4: сбор с ноги не на хранилище — ноги не сводятся":
+        ("        if (free != 0) l.sendToVault(free);\n", ""),
+}
+
+
+def forge_red(contract: str) -> list:
+    """Судья-стенды: имена упавших тестов контракта `contract` (пусто — все зелёные). Ошибка самого forge (сборка, а не
+    тест) — отказ: мутант, который не собирается, ничего не доказывает."""
+    r = subprocess.run([foundry("forge"), "test", "--match-contract", contract], cwd=CONTRACTS,
+                       capture_output=True, text=True, encoding="utf-8", env=dict(os.environ, FOUNDRY_LINT_LINT_ON_BUILD="false"))
+    import re
+    red = list(dict.fromkeys((re.search(r"\]\s+(\w+)\(", ln) or re.search(r"(.{0,120})", ln)).group(1)
+                             for ln in r.stdout.splitlines() if ln.startswith("[FAIL")))
+    if r.returncode != 0 and not red:
+        raise ValueError(f"forge test упал не на тесте: {r.stdout[-1500:]}{r.stderr[-1500:]}")
+    if r.returncode == 0 and red:
+        raise ValueError(f"forge test: rc 0 при упавших тестах {red}")
+    return red
+
+
+def mutate(text: str, name: str, rule) -> str:
+    """Применить мутант к тексту исходника; каждый образец — ровно один раз, иначе правило устарело (отказ)."""
+    for a, b in (rule if isinstance(rule, list) else [rule]):
+        if text.count(a) != 1:
+            raise ValueError(f"мутант «{name}»: образец встречается {text.count(a)} раз — правило устарело")
+        if a == b:
+            raise ValueError(f"мутант «{name}»: замена совпадает с образцом")
+        text = text.replace(a, b)
+    return text
+
+
+def select_mutants(table: dict, args) -> dict:
+    names = list(table)
+    start = next((i for i, k in enumerate(names) if args.start in k), None) if args.start else 0
+    if start is None:
+        raise ValueError(f"мутанта с «{args.start}» в имени нет")
+    lo, hi = (int(x) if x else None for x in args.range.split(":")) if getattr(args, "range", None) else (None, None)
+    pick = names[start:][lo:hi]                         # `--range A:B` — часть таблицы по индексам (прогон частями)
+    chosen = {k: table[k] for k in pick if not args.only or args.only in k}
+    if not chosen:
+        raise ValueError(f"мутантов с «{args.only}» в имени нет")
+    return chosen
+
+
+def mutants_lock(root: str) -> str:
+    """Замок дерева на время саботажа: `root/.mutants.lock`, создание с O_EXCL. Второй раннер в ТОМ ЖЕ дереве — отказ с
+    именем замка. Причина (замер 20.10, слияние rev9 × 9.4): раннер пишет мутант в исходник своего дерева и собирает его
+    `out/`; второй процесс, стартовав, когда в файле уже лежит чужой мутант, принимает его за «исходник», судит чужой
+    мутант своим судьёй и в конце «восстанавливает» дерево в мутированное (sha сходится — с его же неверным оригиналом).
+    Замок остаётся после убитого процесса — удалить руками, убедившись, что исходник равен `git show HEAD:…`."""
+    path = os.path.join(root, ".mutants.lock")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise ValueError(f"мутанты уже идут в этом дереве ({path}): части --range — каждая в своём ворктри "
+                         "(git worktree add --detach); замок от убитого прогона — удалить руками после сверки исходника")
+    os.write(fd, str(os.getpid()).encode()); os.close(fd)
+    return path
+
+
+def sabotage(source: str, chosen: dict, judge, lock_root: str = CONTRACTS) -> list:
+    """Каждый мутант по очереди: записать в `source`, спросить `judge(name)` (список покрасневших судей), вернуть
+    исходник. Исходник восстанавливается при любом исходе, и это проверяется sha до и после. Возврат — выжившие.
+    Один раннер на дерево (`mutants_lock`)."""
+    import hashlib
+    lock = mutants_lock(lock_root)
+    try:
+        return _sabotage(source, chosen, judge, hashlib)
+    finally:
+        os.remove(lock)
+
+
+def _sabotage(source: str, chosen: dict, judge, hashlib) -> list:
+    orig = open(source, "rb").read(); sha = hashlib.sha256(orig).hexdigest()
+    alive = []
+    try:
+        for name, rule in chosen.items():
+            open(source, "wb").write(mutate(orig.decode("utf-8"), name, rule).encode("utf-8"))
+            red = judge(name)
+            print(f"[{'OK' if red else 'FAIL'}] мутант «{name}»: краснеют {red or 'НИ ОДНА'}")
+            if not red:
+                alive.append(name)
+    finally:
+        open(source, "wb").write(orig)
+        build()
+    if hashlib.sha256(open(source, "rb").read()).hexdigest() != sha:
+        raise ValueError(f"исходник {source} не восстановлен после саботажа")
+    print(f"MUTANTS{' --vault' if source in (VAULT_SOURCE, VAULT_EM_SOURCE) else ''}: {'PASS' if not alive else 'FAIL'} "
+          f"({len(chosen) - len(alive)}/{len(chosen)} пойманы)")
+    return alive
+
+
+def cmd_mutants(args) -> int:
+    """Бухгалтерия: каждый мутант обязан покраснеть хотя бы на одной фикстуре — атомарным расчётом или пачками (а если
+    все зелёные — на forge-стендах). Хранилище (`--vault`): на forge-стендах `PoolVaultTest` и `PoolVaultEmergencyTest` —
+    мутанты `PoolVault.sol` (VAULT_MUTANTS), затем модуля аварии `PoolVaultEmergency.sol` (VAULT_EM_MUTANTS); раннер один."""
+    if args.vault:
+        judge = lambda _: forge_red("PoolVault(Emergency)?Test")
+        alive = []
+        for source, table in ((VAULT_SOURCE, VAULT_MUTANTS), (VAULT_EM_SOURCE, VAULT_EM_MUTANTS)):
+            try:
+                chosen = select_mutants(table, args)
+            except ValueError:
+                continue                                 # `--only`/`--start` не про этот файл
+            alive += sabotage(source, chosen, judge)
+        return 1 if alive else 0
+    files = cases() + queue_cases(args.fuzz) + cycle_cases(args.cycles)
+
+    def judge(_name):
+        art = build()
+        # судья — обе формы расчёта: атомарный `monday()` и пачками по одной единице (`--paged`)
+        res = run_many(art, [((fname, paged), f, paged) for paged in (False, True) for fname, f in files], args.jobs,
+                       stop_on_red=not args.all)
+        red = [f"{fname}{' (пачками)' if paged else ''}" for (fname, paged), (bad, _) in sorted(res.items()) if bad]
+        if not red and forge_red("PoolLedger(Emergency|Gens)?Test"):          # ред. 9.5: и стенды права/предела поколений
+            red.append("forge:PoolLedger(Emergency|Gens)Test")
+        return red
+    return 1 if sabotage(SOURCE, select_mutants(MUTANTS, args), judge) else 0
+
+
+# --- selftest ------------------------------------------------------------------------------------------------- #
+def selftest() -> int:
+    ok = []
+
+    def chk(name, cond, detail=""):
+        ok.append(bool(cond)); print(f"  [{'OK' if cond else 'FAIL'}] {name} {detail}")
+    # кодек против `cast abi-encode` — независимый кодировщик
+    vectors = [(["address", "uint256", "int256", "bool", "uint8", "bytes32"],
+                ["0x0000000000000000000000000000000000000fee", 2 ** 128 - 1, -(2 ** 127) + 1, True, 3, id32("w")]),
+               (["int256", "int256", "uint256"], [-1, 7, 0]),
+               (["bytes32", "address"], [id32("op3-15-1"), "0x00000000000000000000000000000000000000ff"])]
+    cast = foundry("cast")
+    for types, vals in vectors:
+        arg = [f"f({','.join(types)})"] + [("0x" + v.hex()) if isinstance(v, bytes) else (str(v).lower() if isinstance(v, bool) else str(v))
+                                            for v in vals]
+        r = subprocess.run([cast, "abi-encode"] + arg, capture_output=True, text=True)
+        chk(f"C1: кодек совпадает с cast abi-encode {types}", r.returncode == 0 and r.stdout.strip() == "0x" + ABI.encode(types, vals).hex(),
+            r.stderr.strip()[:120])
+    words = [5, -3, 2 ** 200]
+    blob = (32).to_bytes(32, "big") + len(words).to_bytes(32, "big") + b"".join((w % ABI.U256).to_bytes(32, "big") for w in words)
+    chk("C2: декодер int256[] читает знаковые и большие слова", ABI.dec_int_array(blob) == words)
+    chk("C3: id32 — круг строка -> bytes32 -> строка", un_id32(int.from_bytes(id32("op3-15-1"), "big")) == "op3-15-1")
+    bad = None
+    try:
+        id32("x" * 33)
+    except ValueError as e:
+        bad = e
+    chk("C4: id32 длиннее 32 байт — ValueError, а не обрезка", bad is not None)
+    a = {"x": {"y": 1, "z": 2}}; b = {"x": {"y": 1, "z": 3}}
+    chk("C5: diff называет путь и оба значения", diff(a, b) == ["/x/z: эталон 2 контракт 3"])
+    caught = None
+    try:
+        views_abi_only_reads({"abi": [{"type": "function", "name": "dump", "stateMutability": "view"},
+                                      {"type": "function", "name": "sneak", "stateMutability": "nonpayable"}]})
+    except ValueError as e:
+        caught = str(e)
+    chk("C6: изменяющая функция в ABI витрин — отказ с именем (delegatecall писал бы в память бухгалтерии)", caught and "sneak" in caught)
+    vtext = open(VAULT_SOURCE, encoding="utf-8").read()
+    stale = []
+    for name, rule in VAULT_MUTANTS.items():
+        try:
+            mutate(vtext, name, rule)
+        except ValueError as e:
+            stale.append(str(e))
+    chk(f"C7: каждый образец VAULT_MUTANTS ({len(VAULT_MUTANTS)}) встречается в PoolVault.sol ровно один раз", not stale,
+        "; ".join(stale)[:300])
+    etext = open(VAULT_EM_SOURCE, encoding="utf-8").read()
+    stale = []
+    for name, rule in VAULT_EM_MUTANTS.items():
+        try:
+            mutate(etext, name, rule)
+        except ValueError as e:
+            stale.append(str(e))
+    chk(f"C7c: каждый образец VAULT_EM_MUTANTS ({len(VAULT_EM_MUTANTS)}) встречается в PoolVaultEmergency.sol ровно один раз",
+        not stale, "; ".join(stale)[:300])
+    ltext = open(SOURCE, encoding="utf-8").read()
+    stale = []
+    for name, rule in MUTANTS.items():
+        try:
+            mutate(ltext, name, rule)
+        except ValueError as e:
+            stale.append(str(e))
+    chk(f"C7b: каждый образец MUTANTS ({len(MUTANTS)}) встречается в PoolLedger.sol ровно один раз", not stale,
+        "; ".join(stale)[:300])
+    dup = None
+    try:
+        mutate("x x", "двойной", ("x", "y"))
+    except ValueError as e:
+        dup = e
+    chk("C8: образец, встреченный дважды, — отказ, а не саботаж обоих мест", dup is not None)
+    # C20: второй раннер мутантов в том же дереве — отказ до записи исходника (гонка частей --range в одном ворктри)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "S.sol"); open(src, "w", encoding="utf-8").write("x")
+        held = mutants_lock(td)
+        touched, refused = [], None
+        try:
+            sabotage(src, {"m": ("x", "y")}, lambda n: touched.append(n) or ["j"], lock_root=td)
+        except ValueError as e:
+            refused = e
+        os.remove(held)
+        free = sabotage(src, {"m": ("x", "y")}, lambda n: ["j"], lock_root=td) == [] and not os.path.exists(held)
+        chk("C20: второй раннер мутантов в том же дереве — отказ, исходник не тронут; после снятия замка — прогон и замок снят",
+            refused is not None and not touched and open(src, encoding="utf-8").read() == "x" and free)
+    # ред. 9.4 перенесена: фикстуры с вызовами аварии — В ПРОГОНЕ (ни одна не исключена), и кодек знает оба вызова
+    with_emergency = sorted(os.path.basename(f) for f in glob.glob(os.path.join(FIXTURES, "scenario_*.json"))
+                            if any(c["call"] in EMERGENCY_CALLS for c in json.load(open(f, encoding="utf-8"))["calls"]))
+    c17 = (with_emergency == [f"scenario_{n}.json" for n in (236, 237, 238, 239, 260, 261)]
+           and not set(with_emergency) - {n for n, _ in cases()} and not EXCLUDED_FIXTURES)
+    chk(f"C17: фикстуры аварии ред. 9.4 ({len(with_emergency)}) — в прогоне, исключений нет", c17,
+        "" if c17 else f"с аварией {with_emergency}, исключены {sorted(EXCLUDED_FIXTURES)}")
+    run_names = {n for n, _ in cases()}
+    with_parts = sorted(os.path.basename(f) for f in glob.glob(os.path.join(FIXTURES, "scenario_*.json"))
+                        if any(c["call"] == "reduce_position" for c in json.load(open(f, encoding="utf-8"))["calls"]))
+    out = sorted(set(with_parts) - run_names)
+    chk(f"C18: все фикстуры с частями ({len(with_parts)}) — в прогоне", with_parts and not out, f"вне прогона: {out}" if out else "")
+    # КЕ10: деплой частями — раскладка, размеры, связность и проверка после деплоя (на своей цепи)
+    art = build()
+    lay = storage_layout()
+    chk(f"C9: раскладка памяти {'/'.join(LEDGER_PARTS)} одна",
+        {"owner", "viewsImpl", "mondayImpl", "projImpl", "emergencyImpl", "bookImpl", "emState"} <= set(lay))
+    base = layout_of(LEDGER_PARTS[0])
+    moved = ([base[0][1], base[0][0]] + base[0][2:], base[1])
+    chk("C10: раскладка с переставленной переменной — расхождение, а не равенство", layout_mismatch(base, moved) is not None)
+    try:
+        sizes = code_sizes(art); why = ""
+    except ValueError as e:
+        sizes = None; why = str(e)
+    chk("C11: все части в EIP-170, initcode каждой — в EIP-3860", sizes is not None, why)
+    chain = Chain()
+    try:
+        m = deploy_pool(chain, art, rehearsal_constants(), rehearsal_roles())
+        rehearsal_core(chain)
+        clean = postdeploy_check(chain, m, art)
+        chk("C12: деплой частями на вычисленный адрес — проверка после деплоя чиста", clean == [], "; ".join(clean)[:300])
+        # ревью-2, #7: та же проверка командой `postdeploy` по RPC-адресу (как боевая цепь) — только чтение: ни блока, ни nonce
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="pd_")
+        mf = os.path.join(tmp, "manifest.json"); json.dump(m, open(mf, "w", encoding="utf-8"))
+        bn0, nc0 = chain.rpc("eth_blockNumber"), chain.rpc("eth_getTransactionCount", chain.me, "latest")
+        cmd = [sys.executable, os.path.abspath(__file__), "postdeploy", "--rpc", chain.url, "--manifest", mf, "--spacing", "0"]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        t = json.loads(json.dumps(m)); t["roles"]["terms"]["t_dead"] = int(t["roles"]["terms"]["t_dead"]) + 1
+        mf_bad = os.path.join(tmp, "bad.json"); json.dump(t, open(mf_bad, "w", encoding="utf-8"))
+        rb = subprocess.run(cmd[:6] + [mf_bad] + cmd[7:], capture_output=True, text=True, encoding="utf-8")
+        same = (chain.rpc("eth_blockNumber"), chain.rpc("eth_getTransactionCount", chain.me, "latest")) == (bn0, nc0)
+        chk("C26: `postdeploy --rpc` по своему anvil — PASS на чистом манифесте, FAIL с именем срока на подменённом; "
+            "блок и nonce цепи не сдвинулись (только чтение)",
+            r.returncode == 0 and "POSTDEPLOY: PASS" in r.stdout and rb.returncode == 1
+            and "PoolVaultEmergency.T_DEAD()" in rb.stdout and same, (r.stdout + r.stderr)[-300:] + (rb.stdout + rb.stderr)[-300:])
+        refused = []
+        for meth in ("eth_sendTransaction", "eth_sendRawTransaction", "anvil_setCode", "eth_sign", "eth_getProof"):
+            try:
+                RemoteChain(chain.url, 0).rpc(meth)
+            except ValueError:
+                refused.append(meth)
+        chk("C27: RemoteChain отказывает ДО сети всему вне перечня только-чтения (отправка, подпись, anvil_*)",
+            len(refused) == 5, f"пропущены {set(('eth_sendTransaction', 'eth_sendRawTransaction', 'anvil_setCode', 'eth_sign', 'eth_getProof')) - set(refused)}")
+        # ревью-2, #5 / H1: граница T_QUEUE_MAX выводится из владельца и параметров — подмена запаса или слагаемых названа
+        t = json.loads(json.dumps(m)); t["roles"]["queue_floor"]["keeper_margin_s"] = int(m["roles"]["terms"]["t_queue_max"])
+        floor_named = any(x.startswith("PoolVaultEmergency.T_QUEUE_MAX() =") and "короче выведенной границы" in x
+                          for x in postdeploy_check(chain, t, art))
+        t = json.loads(json.dumps(m)); del t["roles"]["queue_floor"]
+        try:
+            postdeploy_check(chain, t, art); no_floor = None
+        except ValueError as e:
+            no_floor = str(e)
+        t = json.loads(json.dumps(m)); t["roles"]["delay"] = int(m["roles"]["delay"]) - 1
+        delay_named = any(x.startswith("PoolVault.DELAY() =") for x in postdeploy_check(chain, t, art))
+        P_ = load_params()
+        fc = config_number(P_["roles"]["queue_floor"]["force_close_source"])
+        chk("C28: T_QUEUE_MAX короче выведенной границы — назван; манифест без queue_floor — отказ, а не «чисто»; DELAY не "
+            "манифеста — назван; граница беты = (закрытие владельца + расчёт) сут + запас",
+            floor_named and no_floor and delay_named
+            and queue_max_floor(P_["roles"])[0] == (int(fc) + 7) * DAY_S + P_["roles"]["queue_floor"]["keeper_margin_s"]
+            and P_["roles"]["terms"]["t_queue_max"] >= queue_max_floor(P_["roles"])[0], f"{floor_named} {no_floor} {delay_named}")
+        bad_roles = json.loads(json.dumps(P_)); bad_roles["roles"]["admin"] = "0x" + "11" * 20
+        try:
+            rehearsal_roles(bad_roles); leaked = None
+        except ValueError as e:
+            leaked = str(e)
+        delay_ = P_["roles"]["delay"]
+        chk("C29: параметры беты — DELAY >= MIN_DELAY исходника, каждый срок >= 2·DELAY, ставки комиссии TBD, адрес роли в "
+            "файле параметров — отказ",
+            delay_ >= min_delay() and all(v >= 2 * delay_ for v in P_["roles"]["terms"].values())
+            and set(P_["tbd"]) == {"fee_bps", "ref_share_bps", "open_ref_share_bps"} and leaked,
+            f"{P_['tbd']} {leaked}")
+        t = json.loads(json.dumps(m)); t["parts"]["TradingLegB"]["codehash"] = "0x" + "0" * 64
+        chk("C13: подменённый codehash — проверка называет часть",
+            any(x.startswith("TradingLegB: codehash") for x in postdeploy_check(chain, t, art)))
+        stray = deploy_code(chain, art["leg"]["bytecode"]["object"] + encode(["address"], [REHEARSAL_ADDR["admin"]]).hex(), "нога")
+        t = json.loads(json.dumps(m)); t["parts"]["TradingLegA"]["address"] = stray
+        bad = postdeploy_check(chain, t, art)
+        chk("C14: нога чужого хранилища в манифесте — immutable и vault() не те, хранилище не на неё",
+            any(x.startswith("TradingLegA: immutable") for x in bad) and any("TradingLegA.vault()" in x for x in bad)
+            and any("PoolVault.legA()" in x for x in bad), "" if bad else "проверка чиста")
+        t = json.loads(json.dumps(m)); t["parts"]["PoolLedgerViews"]["address"] = m["parts"]["PoolLedgerProj"]["address"]
+        bad = postdeploy_check(chain, t, art)
+        chk("C15: реализация не та — код не равен сборке и слот viewsImpl не тот",
+            any(x.startswith("PoolLedgerViews: код") for x in bad) and any("PoolLedger.viewsImpl" in x for x in bad),
+            "" if bad else "проверка чиста")
+        burned = None
+        try:
+            deploy_pool(chain, art, rehearsal_constants(), rehearsal_roles(), burn_nonce=True)
+        except ValueError as e:
+            burned = str(e)
+        chk("C16: деплойер потратил nonce до хранилища — хранилище отклонено конструктором", burned and "PoolVault" in burned,
+            burned or "хранилище встало")
+        # ред. 9.4: модуль аварии хранилища — часть манифеста: чужой модуль (иные сроки) назван и по immutable, и по
+        # `PoolVault.emergency()`
+        other = deploy_code(chain, art["vault_em"]["bytecode"]["object"] + encode(["uint256"] * len(EM_TERMS), [10 ** 6] * len(EM_TERMS)).hex(), "модуль")
+        t = json.loads(json.dumps(m)); t["parts"]["PoolVaultEmergency"]["address"] = other
+        t["parts"]["PoolVaultEmergency"]["codehash"] = code_hash(chain, other)
+        bad = postdeploy_check(chain, t, art)
+        chk("C19: модуль аварии не тот — его сроки и адрес в хранилище не совпадают с манифестом",
+            any(x.startswith("PoolVaultEmergency: immutable") for x in bad) and any("PoolVault.emergency()" in x for x in bad),
+            "; ".join(bad)[:300] if bad else "проверка чиста")
+        # ревью 20.10, п. 7: подмена КАЖДОГО поля манифеста, которое проверка раньше не судила, — названа поимённо
+        named = {}
+        for k, v in (("treasury", "0x" + "de" * 20), ("buffer_bps", 1), ("fee_bps", 1), ("ref_share_bps", 1),
+                     ("hold_bps", 1), ("open_ref_share_bps", 1), ("partner_term_weeks", 1)):
+            t = json.loads(json.dumps(m)); t["constants"][k] = v if k == "treasury" else int(m["constants"][k]) + v
+            named[k] = any(x.startswith(f"PoolLedger.params().{k} ") for x in postdeploy_check(chain, t, art))
+        chk(f"C21: params() бухгалтерии — каждое из семи полей манифеста ({len(named)}) при подмене названо",
+            all(named.values()), f"не названы {[k for k, v in named.items() if not v]}")
+        t = json.loads(json.dumps(m)); t["chain_id"] = m["chain_id"] + 1
+        chk("C22: chain-id манифеста не тот — назван", any(x.startswith("chain_id манифеста") for x in postdeploy_check(chain, t, art)))
+        swap = json.loads(json.dumps(m))
+        swap["roles"]["terms"]["t_dead"], swap["roles"]["terms"]["t_queue_max"] = (m["roles"]["terms"]["t_queue_max"],
+                                                                                   m["roles"]["terms"]["t_dead"])
+        bad = postdeploy_check(chain, swap, art)
+        chk("C23: сроки модуля аварии переставлены в манифесте — названы по имени (набор immutable тот же)",
+            any(x.startswith("PoolVaultEmergency.T_DEAD()") for x in bad)
+            and any(x.startswith("PoolVaultEmergency.T_QUEUE_MAX()") for x in bad)
+            and not any(x.startswith("PoolVaultEmergency: immutable") for x in bad), "; ".join(bad)[:300])
+        act = {}
+        for part in ("PoolVault", "TradingLegA", "TradingLegB"):
+            rehearsal_core(chain, m["parts"][part]["address"])
+            act[part] = [x for x in postdeploy_check(chain, m, art) if "Core" in x]
+        rehearsal_core(chain)
+        chain.rpc("anvil_setCode", CORE_USER_EXISTS, "0x")
+        none = [x for x in postdeploy_check(chain, m, art) if "проверить нечем" in x]
+        rehearsal_core(chain)
+        # слияние 2026-10-22: бета на ДВЕ ноги (params.beta.json, legShareBps 5000 — решение оператора 21.10). Обязанность
+        # ноги быть на Core — по доле манифеста (как у `postdeploy_check`), а не по зашитой «одной ноге»; свойство «нога с
+        # долей 0 не обязана» судится отдельно тем же деплоем: манифест с долей BPS (всё ноге A), нога B не на Core — чисто
+        share_ = int(m["roles"]["leg_share_bps"])
+        need_ = {"PoolVault": True, "TradingLegA": share_ > 0, "TradingLegB": share_ < BPS}
+        t = json.loads(json.dumps(m)); t["roles"]["leg_share_bps"] = BPS
+        rehearsal_core(chain, m["parts"]["TradingLegB"]["address"])
+        zero_b = [x for x in postdeploy_check(chain, t, art) if "Core" in x]
+        rehearsal_core(chain)
+        chk("C24: хранилище и каждая нога с долей не на Core — названы (доля — из манифеста); нога с долей 0 — не обязана; "
+            "цепь без прекомпайла — «проверить нечем», а не «чисто»",
+            all(bool(act[k]) == v for k, v in need_.items()) and not zero_b and len(none) == sum(need_.values()),
+            f"доля {share_} {act} {zero_b} {none}")
+        admin = REHEARSAL_ADDR["admin"]
+        chain.rpc("anvil_impersonateAccount", admin); chain.rpc("anvil_setBalance", admin, hex(10 ** 20))
+
+        def as_admin(sig, types, vals):
+            h = chain.rpc("eth_sendTransaction", {"from": admin, "to": m["parts"]["PoolVault"]["address"], "gas": hex(GAS),
+                                                  "data": "0x" + art["vault"]["methodIdentifiers"][sig] + encode(types, vals).hex()})
+            if int(chain.receipt(h)["status"], 16) != 1:
+                raise ValueError(f"{sig} от admin не прошёл")
+        as_admin("proposeKeeper(address)", ["address"], ["0x" + "de" * 20])
+        prop = postdeploy_check(chain, m, art)
+        as_admin("setPartner(address,uint8)", ["address", "uint8"], ["0x" + "de" * 20, 1])
+        init = postdeploy_check(chain, m, art)
+        chk("C25: висящее предложение таймлока и тронутая бухгалтерия — названы",
+            prop == ["PoolVault.proposals(1) не пусто: висит предложение таймлока"]
+            and any(x.startswith("PoolLedger.status().initialized") for x in init), f"{prop} {init}")
+    finally:
+        chain.close()
+    n = len(ok); p = sum(ok)
+    print(f"SELFTEST: {'PASS' if p == n else 'FAIL'} ({p}/{n})")
+    return 0 if p == n else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run"); r.add_argument("--only"); r.add_argument("--verbose", action="store_true")
+    r.add_argument("--paged", action="store_const", const=1, default=0, help="недельный расчёт пачками по одной единице этапа")
+    r.add_argument("--paged-k", type=int, dest="paged", help="то же, пачками по K единиц (K >= 1)")
+    r.add_argument("--jobs", type=int, default=8, help="фикстур одновременно (каждая — своя цепь anvil)")
+    r.add_argument("--fuzz", type=int, default=0, help="ещё N сценариев эталона с длинной очередью заявок (seed 0..N-1)")
+    r.add_argument("--cycles", type=int, default=0, help="ещё `cycle_pool` и N сценариев эталона с плотной книгой доплативших")
+    sub.add_parser("selftest")
+    rh = sub.add_parser("rehearse-deploy", help="репетиция деплоя КЕ10 на своей цепи: манифест, проверка после, размеры")
+    rh.add_argument("--out", help="куда записать манифест (JSON)")
+    pd = sub.add_parser("postdeploy", help="проверка после деплоя по реальной цепи: только чтение (eth_call/eth_getCode/…)")
+    pd.add_argument("--rpc", required=True, help="RPC-адрес цепи (http/https)")
+    pd.add_argument("--manifest", required=True, help="манифест деплоя (JSON, схема pool_deploy_manifest_v1)")
+    pd.add_argument("--spacing", type=float, default=1.0, help="секунд между запросами RPC (по умолчанию 1.0)")
+    m = sub.add_parser("mutants"); m.add_argument("--all", action="store_true"); m.add_argument("--only")
+    m.add_argument("--vault", action="store_true", help="мутанты хранилища PoolVault.sol (судья — forge PoolVaultTest)")
+    m.add_argument("--jobs", type=int, default=8, help="фикстур одновременно")
+    m.add_argument("--start", help="продолжить с первого мутанта, в имени которого есть подстрока")
+    m.add_argument("--range", help="часть таблицы по индексам A:B (после --start), для прогона частями; судья тот же")
+    m.add_argument("--fuzz", type=int, default=16, help="и столько сценариев эталона с длинной очередью (seed 0..N-1)")
+    m.add_argument("--cycles", type=int, default=8, help="и `cycle_pool` + столько сценариев с плотной книгой (seed 0..N-1)")
+    args = ap.parse_args()
+    raise SystemExit({"run": cmd_run, "mutants": cmd_mutants, "rehearse-deploy": cmd_rehearse, "postdeploy": cmd_postdeploy}[args.cmd](args)
+                     if args.cmd != "selftest" else selftest())
+
+
+if __name__ == "__main__":
+    main()

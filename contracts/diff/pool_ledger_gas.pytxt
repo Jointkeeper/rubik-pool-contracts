@@ -1,0 +1,468 @@
+# -*- coding: utf-8 -*-
+"""pool_ledger_gas — замер газа `PoolLedger` на N участниках (вход для Q9, этап 5 плана контракта #2).
+
+Синтетический пул на anvil: N инвесторов вносят по 1 000 USDC, keeper переводит деньги в торговлю, бот рассчитывает и
+исполняет K ордеров, марки, закрытие половины, недельный расчёт, автовывод комиссии, вывод каждого десятого, проход
+очереди. По каждому типу вызова печатается максимум и медиана газа; пачки недельного расчёта — по этапам
+(`mondayStep[этап]`, этапы — `PoolLedgerBase.MS_*`). Сравнивать с лимитом блока HyperEVM: малый блок 2-3 млн, большой
+30 млн (замер R6mech прогона #0); цель контракта — каждая транзакция <= 25 млн.
+
+⚠ С 18.10 число адресов не выше `MAX_INVESTORS_BOUND` контракта (50, README «Газ ред. 9.2.1»): прежние замеры при n = 200
+сделаны при границе 200. Запуск:  python contracts/diff/pool_ledger_gas.pytxt run --n 10,50,200 --orders 10 --step 100
+         python contracts/diff/pool_ledger_gas.pytxt run --n 10,50,200 --debt --step 100 --k2 2   (пул с недостачей)
+         python contracts/diff/pool_ledger_gas.pytxt run --n 200 --debt --every 200 --step 100        (один должник)
+         python contracts/diff/pool_ledger_gas.pytxt gens --n 200 --g 10,20,60 --step 20 --k2 1      (поколение на ордер)
+         python contracts/diff/pool_ledger_gas.pytxt queue --n 200 --m 0,50,200 --step 50 --k2 1     (m заявок на держателя)
+         python contracts/diff/pool_ledger_gas.pytxt chain --n 200 --step 50 --k2 1                  (цепочка возвратов)
+         python contracts/diff/pool_ledger_gas.pytxt cycle --n 200 --k 2,3,n --step 50 --k2 1        (зачёт цикла, ред. 9.2)
+         python contracts/diff/pool_ledger_gas.pytxt selftest
+`--step` — единиц пачки на этапах строк и реферальных долей, `--k2` — на тяжёлых этапах фазы 2 (возвраты, соучастники,
+таблица «весь пул», зачёт); 0 в `--step` — атомарный `monday()`. Это ЗАМЕР, а не гейт."""
+from __future__ import annotations
+import argparse, os, statistics, sys
+from importlib.machinery import SourceFileLoader
+sys.stdout.reconfigure(encoding="utf-8")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+D = sys.modules.get("pool_ledger_diff") or SourceFileLoader("pool_ledger_diff", os.path.join(HERE, "pool_ledger_diff.pytxt")).load_module()
+USD = 10 ** 6
+CONSTANTS = {"treasury": "0x0000000000000000000000000000000000000fee", "buffer_bps": "1000", "fee_bps": "5000",
+             "ref_share_bps": "2000", "hold_bps": "3500", "open_ref_share_bps": "200", "partner_term_weeks": "52",
+             "partners": [], "min_deposit": "0", "max_investors": None}   # предел — граница контракта MAX_INVESTORS_BOUND
+LIGHT = (0, 1)              # этапы, где единица пачки дешёвая: строки и реферальные доли (`--step`); остальные — `--k2`
+
+
+class GasLedger(D.Ledger):
+    """Тот же Ledger дифференциала, но копит газ каждого принятого вызова по типу (пачки расчёта — по этапу)."""
+    def __init__(self, *a, **k):
+        self.gas = {}; self.label = None
+        super().__init__(*a, **k)
+
+    def send(self, sig, types, values) -> bool:
+        h = self.c.rpc("eth_sendTransaction", {"from": self.c.me, "to": self.addr, "data": self.data(sig, types, values),
+                                               "gas": hex(D.GAS)})
+        rc = self.c.receipt(h)
+        ok = int(rc["status"], 16) == 1
+        if ok:
+            self.gas.setdefault(self.label or sig.split("(")[0], []).append(int(rc["gasUsed"], 16))
+        return ok
+
+
+def addr(i: int) -> str:
+    return "0x" + f"{0x1000 + i:040x}"
+
+
+def dep(i: int, usd: int = 1000) -> dict:
+    return {"call": "deposit", "addr": addr(i), "amount": usd * USD, "referrer": None, "payout": False, "path": "evm",
+            "ledger_ref": None}
+
+
+def must(L, c):
+    if not L.apply(c):
+        raise ValueError(f"{c} отклонён")
+
+
+def run_monday(L, step: int, k2: int):
+    """Недельный расчёт: одним вызовом (`step` 0) или пачками, как keeper: `mondayStep` до этапа DONE, затем `mondayEnd`."""
+    if not step:
+        must(L, {"call": "monday"})
+        return
+    L.next_week()                                       # ревью-3b: календарный расчёт — новая календарная неделя
+    if not L.send("mondayBegin()", [], []):
+        raise ValueError("mondayBegin отклонён")
+    while True:
+        stage = L.progress()[0]
+        if stage == D.MS_DONE:
+            break
+        L.label = f"mondayStep[{stage}]"
+        ok = L.send("mondayStep(uint256)", ["uint256"], [step if stage in LIGHT else k2])
+        L.label = None
+        if not ok:
+            raise ValueError(f"mondayStep отклонён на этапе {stage}")
+    if not L.send("mondayEnd()", [], []):
+        raise ValueError("mondayEnd отклонён")
+
+
+def after_monday(L, n: int):
+    """Автовывод комиссии, вывод свободного каждым десятым, проход очереди и забор — как keeper после расчёта."""
+    L.apply({"call": "treasury_payout"})
+    for i in range(0, n, 10):
+        free = D.ABI.signed(L.call("freeStake(address,bool)", ["address", "bool"], [addr(i), False]))
+        if free:
+            must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": free})
+    L.apply({"call": "pay_queue"})
+    for i in range(0, n, 10):
+        L.apply({"call": "claim", "addr": addr(i)})
+
+
+def summary(L) -> dict:
+    return {name: (max(v), int(statistics.median(v)), len(v)) for name, v in L.gas.items()}
+
+
+def bench(art: dict, n: int, k: int, step: int = 0, k2: int = 1) -> dict:
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, CONSTANTS)
+        for i in range(n):
+            must(L, dep(i))
+        must(L, {"call": "sweep_to_perp"})
+        for j in range(k):
+            for call in ({"call": "size_order", "pid": f"o{j}", "notional": n * 1000 * USD // k}, {"call": "fill_order", "pid": f"o{j}"}):
+                must(L, call)
+        for j in range(k):
+            L.apply({"call": "mark_position", "pid": f"o{j}", "upnl": (-1) ** j * 5 * USD * n // k})
+        # депозит новичка при открытых марках: быстрая граница «убытка нет» не проходит — честный обход проекции
+        must(L, dep(n))
+        for j in range(0, k, 2):
+            L.apply({"call": "close_position", "pid": f"o{j}", "realized": 10 * USD * n // k})
+        run_monday(L, step, k2)
+        after_monday(L, n)
+        return summary(L)
+    finally:
+        chain.close()
+
+
+def bench_debt(art: dict, n: int, step: int = 0, every: int = 10, k2: int = 1) -> dict:
+    """Ред. 9.1 — пул С НЕДОСТАЧЕЙ. Неделя 1: один ордер 1.5x капитала; каждый `every`-й выводит и забирает свободное (475 из
+    1000 при удержании 525); марк −60 % нотионала (доля 900): у вышедших недостача по маркам 375 — проекция с должниками в
+    каждой выплате; закрытие и расчёт с разделом недостачи (доплачивают соучастники). Неделя 2: должники вносят снова,
+    ордер с прибылью 50 % — их прибыль возвращает долг доплатившим (этап возвратов, по работе на должника). Депозит при
+    проектной недостаче — revert по правилу (гейт ред. 9.1), его газ здесь не мерится."""
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, CONSTANTS)
+        for i in range(n):
+            must(L, dep(i))
+        must(L, {"call": "sweep_to_perp"})
+        must(L, {"call": "size_order", "pid": "big", "notional": n * 1500 * USD})
+        must(L, {"call": "fill_order", "pid": "big"})
+        must(L, {"call": "set_withdrawable", "amount": n * 900 * USD})
+        out = list(range(0, n, every))
+        for i in out:
+            must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": 475 * USD})
+            L.apply({"call": "claim", "addr": addr(i)})
+        must(L, {"call": "mark_position", "pid": "big", "upnl": -n * 900 * USD})
+        if L.apply(dep(n)):
+            raise ValueError("депозит при проектной недостаче принят — гейт ред. 9.1 не работает")
+        for i in (1, 2):                                   # вывод соучастника при должниках: проекция с hold (every > 2)
+            free = D.ABI.signed(L.call("freeStake(address,bool)", ["address", "bool"], [addr(i), False]))
+            if free:
+                must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": free})
+            L.apply({"call": "claim", "addr": addr(i)})
+        must(L, {"call": "close_position", "pid": "big", "realized": -n * 900 * USD})
+        run_monday(L, step, k2)
+        st = L.state()
+        owed = sum(r["uncovered"] for r in st["inv"].values())
+        if owed != len(out) * 375 * USD or st["shortfall"] != 0:
+            raise ValueError(f"сценарий не дал ожидаемой доплаты: долг {owed}, счёт пула {st['shortfall']}")
+        L.apply({"call": "treasury_payout"})
+        # неделя 2: должники возвращаются, прибыль недели возвращает их долг доплатившим
+        for i in out:
+            must(L, dep(i))
+        must(L, {"call": "sweep_to_perp"})
+        cap = sum(r["stake"] for r in L.state()["inv"].values())
+        must(L, {"call": "size_order", "pid": "w2", "notional": cap})
+        must(L, {"call": "fill_order", "pid": "w2"})
+        must(L, {"call": "close_position", "pid": "w2", "realized": cap // 2})
+        must(L, {"call": "set_withdrawable", "amount": cap})
+        run_monday(L, step, k2)
+        st = L.state()
+        owed = sum(r["uncovered"] for r in st["inv"].values())
+        if owed != 0 or st["creditors"]:
+            raise ValueError(f"неделя 2 не вернула долг: осталось {owed}, книга {len(st['creditors'])} пар")
+        after_monday(L, n)
+        return summary(L)
+    finally:
+        chain.close()
+
+
+CONST0 = dict(CONSTANTS, buffer_bps="0")   # без буфера: ликвидность = withdrawable, заявки стоят без выплат
+
+
+def gens_count(L) -> int:
+    return len(L.state()["snaps"])
+
+
+def bench_gens(art: dict, n: int, G: int, step: int, k2: int, every: int = 10) -> dict:
+    """ОДНО ПОКОЛЕНИЕ НА ОРДЕР (находка M2): G ордеров (вместе 1.5x капитала) открываются по одному, и каждый метится в
+    небольшой минус — веса следующего снимка другие, поколение новое. Депозит новичка при марках (честный обход проекций),
+    вывод и забор каждого `every`-го при G живых поколениях с бумажным убытком; закрытие ПЕРВОЙ половины с убытком 0.85
+    капитала: у вышедших недостача в каждом из G/2 поколений — раздел соучастников по (должник, поколение). Расчёт
+    пачками; затем закрытие второй половины в ноль и второй расчёт — G/2 мёртвых поколений в `mondayEnd`."""
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, CONSTANTS)
+        for i in range(n):
+            must(L, dep(i))
+        must(L, {"call": "sweep_to_perp"})
+        nj = n * 1500 * USD // G
+        for j in range(G):
+            must(L, {"call": "size_order", "pid": f"g{j}", "notional": nj})
+            must(L, {"call": "fill_order", "pid": f"g{j}"})
+            must(L, {"call": "mark_position", "pid": f"g{j}", "upnl": -(j + 1) * USD})
+        if gens_count(L) != G:
+            raise ValueError(f"поколений {gens_count(L)}, ожидалось {G}")
+        must(L, dep(n))
+        must(L, {"call": "set_withdrawable", "amount": n * 800 * USD})
+        for i in range(0, n, every):
+            must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": 475 * USD})
+            L.apply({"call": "claim", "addr": addr(i)})
+        L.apply({"call": "pay_queue"})
+        half = G // 2
+        for j in range(half):
+            must(L, {"call": "close_position", "pid": f"g{j}", "realized": -(n * 850 * USD // half)})
+        run_monday(L, step, k2)
+        if not any(r["uncovered"] for r in L.state()["inv"].values()):
+            raise ValueError("сценарий не дал должников")
+        after_monday(L, n)
+        # новый ордер при G/2 живых поколениях и должниках по маркам (их бумажный убыток — недостача по маркам): вес
+        # каждого участника вычитает `hold` — худшую долю по поколениям убытка должников
+        L.label = "sizeOrder (должники по маркам)"
+        must(L, {"call": "size_order", "pid": "late", "notional": USD})
+        L.label = None
+        must(L, {"call": "cancel_order", "pid": "late"})
+        for j in range(half, G):
+            must(L, {"call": "close_position", "pid": f"g{j}", "realized": 0})
+        run_monday(L, step, k2)
+        if gens_count(L) != 0:
+            raise ValueError(f"после второго расчёта живых поколений {gens_count(L)}")
+        after_monday(L, n)
+        return summary(L)
+    finally:
+        chain.close()
+
+
+def bench_queue(art: dict, n: int, m: int, step: int, k2: int) -> dict:
+    """ОЧЕРЕДЬ ПО m ЗАЯВОК НА ДЕРЖАТЕЛЯ (находка M1): один должник (адрес 0) и n−1 держателей. Ордер убытка открыт на весь
+    капитал; должник выводит и забирает 600 из 1000; второй ордер 3x капитала держит заявки (удержание 35 % доли нотионала
+    больше капитала); держатели подают по m заявок в 1 микро ПО КРУГУ (заявки адресов перемежаются по id), ликвидности нет.
+    Закрытие убытка (−600 на 1000) даёт должнику недостачу 200 — её доплачивают все держатели; расчёт пачками при
+    ликвидности, но заявки держит удержание. Затем большой ордер закрывается в ноль: проход очереди с ликвидностью на
+    половину заявок (точка упора посреди перемешанного потока), потом на всё — и второй расчёт."""
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, CONST0)
+        for i in range(n):
+            must(L, dep(i))
+        must(L, {"call": "sweep_to_perp"})
+        must(L, {"call": "size_order", "pid": "loss", "notional": n * 1000 * USD})
+        must(L, {"call": "fill_order", "pid": "loss"})
+        must(L, {"call": "set_withdrawable", "amount": 600 * USD})
+        must(L, {"call": "withdraw", "addr": addr(0), "reward": False, "amount": 600 * USD})
+        must(L, {"call": "claim", "addr": addr(0)})
+        must(L, {"call": "set_withdrawable", "amount": 0})
+        must(L, {"call": "size_order", "pid": "big", "notional": n * 3000 * USD})
+        must(L, {"call": "fill_order", "pid": "big"})
+        L.label = "withdraw (подача заявок)"
+        for _ in range(m):
+            for i in range(1, n):
+                must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": 1})
+        L.label = None
+        must(L, {"call": "close_position", "pid": "loss", "realized": -n * 600 * USD})
+        must(L, {"call": "set_withdrawable", "amount": n * 100 * USD})
+        run_monday(L, step, k2)
+        st = L.state()
+        if len(st["queue"]) != (n - 1) * m or st["inv"][addr(0)]["uncovered"] != 200 * USD:
+            raise ValueError(f"очередь {len(st['queue'])} заявок, долг должника {st['inv'][addr(0)]['uncovered']}")
+        must(L, {"call": "close_position", "pid": "big", "realized": 0})
+        must(L, {"call": "set_withdrawable", "amount": (n - 1) * m // 2})
+        L.label = "payQueue (упор посреди)"
+        must(L, {"call": "pay_queue"})
+        L.label = None
+        must(L, {"call": "set_withdrawable", "amount": n * 100 * USD})
+        must(L, {"call": "pay_queue"})
+        if L.state()["queue"]:
+            raise ValueError("очередь не опустела при ликвидности на всё")
+        run_monday(L, step, k2)
+        after_monday(L, n)
+        return summary(L)
+    finally:
+        chain.close()
+
+
+def build_chain(L, n: int):
+    """Книга-цепочка A_0 -> A_1 -> … -> A_{n-1} (A_i должен A_{i+1}): звено i — ордер только на A_i и A_{i+1} (у остальных
+    капитала нет), A_i выводит всё, кроме 10; убыток 0.6 его доли — недостачу доплачивает A_{i+1}."""
+    must(L, dep(0, 100))
+    must(L, dep(1))
+    for i in range(n - 1):
+        if i:
+            must(L, dep(i + 1))
+        must(L, {"call": "sweep_to_perp"})
+        s_i = L.state()["inv"][addr(i)]["stake"]
+        nt = 3 * (s_i + 1000 * USD)
+        must(L, {"call": "size_order", "pid": f"c{i}", "notional": nt})
+        must(L, {"call": "fill_order", "pid": f"c{i}"})
+        must(L, {"call": "set_withdrawable", "amount": s_i})
+        must(L, {"call": "withdraw", "addr": addr(i), "reward": False, "amount": s_i - 10 * USD})
+        must(L, {"call": "claim", "addr": addr(i)})
+        must(L, {"call": "close_position", "pid": f"c{i}", "realized": -(nt // 5)})
+        must(L, {"call": "set_withdrawable", "amount": 0})
+        L.label = "monday (звено цепочки)"
+        must(L, {"call": "monday"})
+        L.label = None
+    links = sum(1 for (a, b) in L.state()["creditors"] if b != D.POOL_CREDITOR)
+    if links != n - 1:
+        raise ValueError(f"звеньев цепочки {links}, ожидалось {n - 1}")
+
+
+def bench_chain(art: dict, n: int, step: int, k2: int) -> dict:
+    """ДЛИННАЯ ЦЕПОЧКА ВОЗВРАТОВ БЕЗ ЦИКЛА (`build_chain`, n−1 звеньев). В конце A_0 вносит снова и получает прибыль:
+    возврат идёт A_1, его записанный долг — A_2, и так n−1 работ возврата в одном расчёте (пачками)."""
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, dict(CONST0, hold_bps="0"))  # без удержания: вывод должника звена выплачивается сразу
+        build_chain(L, n)
+        must(L, dep(0))
+        must(L, {"call": "sweep_to_perp"})
+        st = L.state()
+        cap = st["inv"][addr(0)]["stake"] + st["inv"][addr(n - 1)]["stake"]
+        must(L, {"call": "size_order", "pid": "win", "notional": 2 * cap})
+        must(L, {"call": "fill_order", "pid": "win"})
+        must(L, {"call": "close_position", "pid": "win", "realized": cap})
+        run_monday(L, step, k2)
+        # возврат A_0 (его долг d_0 — наименьший в цепочке) проходит ВСЕ звенья: работ этапа возвратов ровно n − 1
+        works = len(L.gas.get("mondayStep[2]", [])) * k2
+        if works < n - 1 or L.state()["inv"][addr(0)]["uncovered"] != 0:
+            raise ValueError(f"цепочка: {works} работ возврата при {n - 1} звеньях")
+        return summary(L)
+    finally:
+        chain.close()
+
+
+def bench_cycle(art: dict, n: int, k: int, step: int, k2: int) -> dict:
+    """ЗАЧЁТ ЦИКЛА ИЗ k (ред. 9.2) В КНИГЕ С ХВОСТОМ. Книга — цепочка `build_chain` из n−1 звеньев (A_i должен A_{i+1}); при
+    k < n за вершиной A_{k-1} идёт хвост A_{k-1} -> … -> A_{n-1}. Неделя замыкания: A_0 вносит 1000 (A_{k-1} — 200, если у него нет
+    капитала), A_{k-1} «выходит» до убытка, его недостачу доплачивают держатели капитала — A_0 и последний A_{n-1}: запись
+    A_{k-1} -> A_0 замыкает цикл A_0 -> … -> A_{k-1} -> A_0, этап зачёта ищет путь длины k−1 (открывает k вершин) и снимает
+    минимум с k рёбер; при k = n цикл проходит через весь пул. Следующая неделя — A_{k-1} вносит снова, прибыль всех держателей:
+    его возврат идёт по оставшейся ацикличной книге — остатку кольца и хвосту до A_{n-1} (этап возвратов). k = 2 — сценарий ревьюера (A <-> B) на долларовой шкале, k = 3 — цикл из трёх."""
+    chain = D.Chain()
+    try:
+        L = GasLedger(chain, art, dict(CONST0, hold_bps="0"))
+        build_chain(L, n)
+        d = k - 1
+        must(L, dep(0))
+        if L.state()["inv"][addr(d)]["stake"] < 100 * USD:
+            must(L, dep(d, 200))                   # мало: выведя всё, кроме 10, он не уводит стоимость пула ниже убытка
+        must(L, {"call": "sweep_to_perp"})
+        st = L.state()
+        s_d = st["inv"][addr(d)]["stake"]
+        nt = 3 * sum(r["stake"] for r in st["inv"].values())
+        must(L, {"call": "size_order", "pid": "ring", "notional": nt})
+        must(L, {"call": "fill_order", "pid": "ring"})
+        must(L, {"call": "set_withdrawable", "amount": s_d})
+        must(L, {"call": "withdraw", "addr": addr(d), "reward": False, "amount": s_d - 10 * USD})
+        must(L, {"call": "claim", "addr": addr(d)})
+        must(L, {"call": "close_position", "pid": "ring", "realized": -(nt // 5)})
+        must(L, {"call": "set_withdrawable", "amount": 0})
+        ring = [(addr(i), addr(i + 1)) for i in range(d)] + [(addr(d), addr(0))]
+        before = L.state()["creditors"]
+        run_monday(L, step, k2)
+        book = {e: x for e, x in L.state()["creditors"].items() if e[1] != D.POOL_CREDITOR}
+        if all(e in book for e in ring):
+            raise ValueError(f"цикл из {k} не зачтён: все его рёбра в книге")
+        if not any(before.get(e, 0) != book.get(e, 0) for e in ring[:-1]):
+            raise ValueError("зачёт не тронул рёбра пути")
+        must(L, dep(d))                            # его прибыль следующей недели гасит его долги — и дальше по хвосту
+        must(L, {"call": "sweep_to_perp"})
+        st = L.state()
+        cap = sum(r["stake"] for r in st["inv"].values())
+        must(L, {"call": "size_order", "pid": "win", "notional": 2 * cap})
+        must(L, {"call": "fill_order", "pid": "win"})
+        must(L, {"call": "close_position", "pid": "win", "realized": cap})
+        run_monday(L, step, k2)
+        return summary(L)
+    finally:
+        chain.close()
+
+
+def print_res(title: str, res: dict):
+    print(title)
+    for name, (mx, med, cnt) in sorted(res.items(), key=lambda kv: -kv[1][0]):
+        print(f"   {name:<26} {mx:>12,} {med:>12,} {cnt:>6}")
+
+
+def cmd_gens(args) -> int:
+    art = D.build()
+    for n in [int(x) for x in args.n.split(",")]:
+        for G in [int(x) for x in args.g.split(",")]:
+            print_res(f"== N={n}, поколение на ордер G={G}, пачки {args.step}/{args.k2} (газ: максимум / медиана / вызовов)",
+                      bench_gens(art, n, G, args.step, args.k2))
+    return 0
+
+
+def cmd_queue(args) -> int:
+    art = D.build()
+    for n in [int(x) for x in args.n.split(",")]:
+        for m in [int(x) for x in args.m.split(",")]:
+            print_res(f"== N={n}, по m={m} заявок на держателя, пачки {args.step}/{args.k2} (газ: максимум / медиана / вызовов)",
+                      bench_queue(art, n, m, args.step, args.k2))
+    return 0
+
+
+def cmd_chain(args) -> int:
+    art = D.build()
+    for n in [int(x) for x in args.n.split(",")]:
+        print_res(f"== N={n}, цепочка возвратов из {n - 1} звеньев, пачки {args.step}/{args.k2} (газ: максимум / медиана / вызовов)",
+                  bench_chain(art, n, args.step, args.k2))
+    return 0
+
+
+def cmd_cycle(args) -> int:
+    art = D.build()
+    for n in [int(x) for x in args.n.split(",")]:
+        for k in [n if x == "n" else int(x) for x in args.k.split(",")]:
+            print_res(f"== N={n}, цикл из {k} в книге-цепочке из {n - 1} звеньев, пачки {args.step}/{args.k2} "
+                      f"(газ: максимум / медиана / вызовов)", bench_cycle(art, n, k, args.step, args.k2))
+    return 0
+
+
+def cmd_run(args) -> int:
+    art = D.build()
+    for n in [int(x) for x in args.n.split(",")]:
+        every = args.every if args.every else n
+        res = bench_debt(art, n, args.step, every, args.k2) if args.debt else bench(art, n, args.orders, args.step, args.k2)
+        what = f"пул с недостачей (ред. 9.1), должник — каждый {every}-й" if args.debt else f"K={args.orders} ордеров"
+        print(f"== N={n} участников, {what}, пачки {args.step}/{args.k2} (газ: максимум / медиана / вызовов)")
+        for name, (mx, med, cnt) in sorted(res.items(), key=lambda kv: -kv[1][0]):
+            print(f"   {name:<18} {mx:>12,} {med:>12,} {cnt:>5}")
+    return 0
+
+
+def selftest() -> int:
+    ok = []
+
+    def chk(name, cond):
+        ok.append(bool(cond)); print(f"  [{'OK' if cond else 'FAIL'}] {name}")
+    chk("G1: адреса участников различны и 20-байтовые", len({addr(i) for i in range(300)}) == 300 and all(len(addr(i)) == 42 for i in (0, 299)))
+    chk("G2: замер стоит на кодеке и цепи дифференциала, а не на своей копии", GasLedger.__mro__[1] is D.Ledger)
+    n = len(ok); p = sum(ok)
+    print(f"SELFTEST: {'PASS' if p == n else 'FAIL'} ({p}/{n})")
+    return 0 if p == n else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run"); r.add_argument("--n", default="10,50"); r.add_argument("--orders", type=int, default=10)
+    r.add_argument("--step", type=int, default=0, help="пачка строк и реферальных долей (0 — атомарный monday)")
+    r.add_argument("--k2", type=int, default=1, help="пачка тяжёлых этапов фазы 2: возвраты, соучастники, таблица")
+    r.add_argument("--debt", action="store_true", help="пул с недостачей по маркам, разделом и возвратами (ред. 9.1)")
+    r.add_argument("--every", type=int, default=10, help="--debt: должником становится каждый EVERY-й (0 — один должник)")
+    g = sub.add_parser("gens"); g.add_argument("--n", default="50"); g.add_argument("--g", default="10,20,60")
+    q = sub.add_parser("queue"); q.add_argument("--n", default="50"); q.add_argument("--m", default="0,50,200")
+    c = sub.add_parser("chain"); c.add_argument("--n", default="50")
+    y = sub.add_parser("cycle"); y.add_argument("--n", default="50")
+    y.add_argument("--k", default="2,3,n", help="длины циклов через запятую; n — цикл через весь пул")
+    for x in (g, q, c, y):
+        x.add_argument("--step", type=int, default=20, help="пачка строк и реферальных долей")
+        x.add_argument("--k2", type=int, default=1, help="пачка тяжёлых этапов фазы 2")
+    sub.add_parser("selftest")
+    args = ap.parse_args()
+    cmds = {"run": cmd_run, "gens": cmd_gens, "queue": cmd_queue, "chain": cmd_chain, "cycle": cmd_cycle}
+    raise SystemExit(cmds[args.cmd](args) if args.cmd in cmds else selftest())
+
+
+if __name__ == "__main__":
+    main()

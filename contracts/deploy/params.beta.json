@@ -1,0 +1,40 @@
+{
+  "schema": "pool_deploy_params_v1",
+  "network": "hyperevm-mainnet",
+  "_note": "Бета на деньгах оператора: TVL 1000 -> 10000 USDC (подъём — setTvlCap admin'а), <= 10 участников, ДВЕ ноги по 50 % раздачи (legShareBps 5000, решение оператора 21.10: обе ноги активируются на Core до первой раздачи). Ключей и адресов ролей здесь нет: <PLACEHOLDER> заполняет план деплоя, TBD — решение оператора. Сроки — секунды; вывод каждого — README «Параметры беты». Судьи: `pool_ledger_diff.pytxt rehearse-deploy` (репетиция на этих числах) и `postdeploy` (сверка цепи с манифестом).",
+  "roles": {
+    "admin": "<ADMIN_SAFE>",
+    "keeper": "<KEEPER>",
+    "guardian": "<GUARDIAN>"
+  },
+  "vault": {
+    "delay": 172800,
+    "tvl_cap": 1000000000,
+    "leg_share_bps": 5000
+  },
+  "terms": {
+    "t_stuck": 345600,
+    "t_dead": 345600,
+    "t_nomonday": 1296000,
+    "t_serve": 345600,
+    "t_queue_max": 2419200
+  },
+  "queue_floor": {
+    "force_close_source": "config/operational_limits.json:exit_target.profit_target_force_close_d",
+    "settle_d": 7,
+    "keeper_margin_s": 345600
+  },
+  "ledger": {
+    "treasury": "<TREASURY>",
+    "min_deposit": 10000000,
+    "max_investors": 10,
+    "max_gens": 1000,
+    "fee_bps": "TBD",
+    "ref_share_bps": "TBD",
+    "open_ref_share_bps": "TBD",
+    "hold_bps": "config/operational_limits.json:protection.disaster_sl_pct",
+    "buffer_bps": 1000,
+    "partner_term_weeks": 52,
+    "partners": []
+  }
+}

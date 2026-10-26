@@ -1,0 +1,798 @@
+# -*- coding: utf-8 -*-
+"""vault_keeper_stand — anvil-стенд keeper'а пула против НАСТОЯЩИХ `PoolVault`/`PoolLedger` из `contracts/src`.
+
+Что судит (этап β, план 2026-10-17-pool-keeper-and-bot-link §8, K3/K6 при малом N): боевой путь keeper'а целиком —
+ядро `runtime/vault_keeper.pytxt` -> `EvmVaultClient` -> журнал nonce `runtime/evm_rpc.pytxt` -> подпись `eth_account`
+в процессе -> `eth_sendRawTransaction` в anvil -> настоящий байткод хранилища и бухгалтерии.
+  ST1 зачисление `Send`: запись Core-леджера -> `creditDeposit(отправитель, сумма, hash записи)`;
+  ST2 повтор `ledgerRef`: та же запись ещё раз -> ни одной транзакции; журналы потеряны -> `ledger_ref used`;
+  ST3 выплата: заявка -> `processWithdrawals` -> `claimFor` только на активированный адрес; подтверждение — ростом
+      Core-баланса получателя по прекомпайлу; молчаливый отказ CoreWriter (receipt 1, денег нет) -> стоп;
+  ST4 транзакция с ключа keeper'а мимо журнала на настоящей цепи -> `ForeignTransaction`;
+  ST5-ST12 поток беты на втором деплое: депозит -> раздача ногам -> вход (`sizeOrder`, первый филл -> `fillOrder`) ->
+      марк -> закрытие (`closePosition`) -> атомарный `monday()` по расписанию рескора -> `treasuryPayout` -> вывод с ног
+      -> `processWithdrawals` -> `claimFor`; падение keeper'а на границах (решение записано / подписано, не замайнено /
+      замайнено, `op_done` не записан / между выводами с ноги) и повтор после рестарта: исход тот же, лишних транзакций
+      нет; сверка §3.8 на настоящем `reconcile()`.
+  ST13-ST18 третий деплой (находки ревью β): депозит формой `send`, НЕНУЛЕВАЯ задержка индексации венью, funding на
+      границе часа, журнал nonce ПОТЕРЯН после каждой денежной операции (creditDeposit, sweepToLegs, legToPerp, monday,
+      treasuryPayout, processWithdrawals, legToSpot, legSendToVault, setWithdrawable, payQueue, claimFor) — ни одной
+      лишней транзакции; V7 (расчёт открыт между setWithdrawable и processWithdrawals) на настоящем контракте; недостача
+      G1 на настоящем `reconcile()`.
+
+HyperCore — моки `contracts/test/mocks/CoreMocks.sol`, поставленные `anvil_setCode` по адресам `HLConstants`
+(владелец адресов — `analysis/e96_vault_research_gate.hl_constant_address`), и питоновский «Core» стенда: балансы spot,
+perp ног, позиции, марки, активация, леджер `userNonFundingLedgerUpdates`, филлы и funding ноги, исполнение действий
+CoreWriter (spotSend, usdClassTransfer) ПОСЛЕ блока по событиям мока. Ключ keeper'а — свежий `Account.create()`
+(в коде и логах только адрес); цепь — anvil дифференциала (`pool_ledger_diff.Chain`).
+
+Запуск:  python contracts/diff/vault_keeper_stand.pytxt run      (Foundry — HL_FOUNDRY_BIN или PATH)
+"""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from decimal import Decimal
+from importlib.machinery import SourceFileLoader
+
+sys.stdout.reconfigure(encoding="utf-8")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+D = sys.modules.get("pool_ledger_diff") or SourceFileLoader("pool_ledger_diff", os.path.join(HERE, "pool_ledger_diff.pytxt")).load_module()
+ABI = D.ABI
+RPC = sys.modules.get("evm_rpc") or SourceFileLoader("evm_rpc", os.path.join(ROOT, "runtime", "evm_rpc.pytxt")).load_module()
+VK = sys.modules.get("vault_keeper") or SourceFileLoader("vault_keeper", os.path.join(ROOT, "runtime", "vault_keeper.pytxt")).load_module()
+OB = VK.OB
+LB = VK.LB
+E96 = sys.modules.get("e96_gate") or SourceFileLoader("e96_gate", os.path.join(ROOT, "analysis", "e96_vault_research_gate.pytxt")).load_module()
+
+OUT = os.path.join(ROOT, "contracts", "out")
+CORE_WRITER = "0x3333333333333333333333333333333333333333"
+SMALL_BLOCK_GAS = 3_000_000      # лимит малого блока HyperEVM — замер testnet 17.10 (`block_gas_limit` evidence R8/S2)
+
+SPOT_SEND_ACTION = 6
+USD_CLASS_ACTION = 7
+TIMER = os.path.join(ROOT, "systemd", "hl-followk-weekly.timer")
+ASSETS = {"BTC": {"index": 0, "sz_decimals": 5}, "ETH": {"index": 1, "sz_decimals": 4}}
+MOCKS = {"SpotBalanceMock": "SPOT_BALANCE_PRECOMPILE_ADDRESS", "CoreUserExistsMock": "CORE_USER_EXISTS_PRECOMPILE_ADDRESS",
+         "MarkPxMock": "MARK_PX_PRECOMPILE_ADDRESS", "Position2Mock": "POSITION2_PRECOMPILE_ADDRESS",
+         "AccountMarginSummaryMock": "ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS",
+         "WithdrawableMock": "WITHDRAWABLE_PRECOMPILE_ADDRESS"}
+
+
+def art(sol: str, name: str) -> dict:
+    p = os.path.join(OUT, sol, f"{name}.json")
+    if not os.path.isfile(p):
+        raise ValueError(f"нет артефакта {p} — forge build")
+    return json.load(open(p, encoding="utf-8"))
+
+
+class Crash(Exception):
+    """Падение keeper'а, вброшенное стендом: процесс умирает, журналы остаются."""
+
+
+class Core:
+    """«HyperCore» стенда: состояние держат моки на цепи и этот объект (perp ног, позиции, марки), леджер хранилища,
+    филлы и funding ноги — здесь. Время — общие часы стенда."""
+    def __init__(self, chain, vault: str, legs, pc: dict, clock):
+        self.c = chain; self.vault = vault.lower(); self.legs = [l.lower() for l in legs]; self.pc = pc
+        self.clock = clock; self.ledger = []; self.silent_reject = False; self.last_block = 0; self.rejected = []
+        self.perp = {l: Decimal(0) for l in self.legs}; self.pos = {}; self.px = {}; self.fills = {l: [] for l in self.legs}
+        self.funding = {l: [] for l in self.legs}; self.n_tid = 0; self.modes = {}
+        self.lag = 0          # задержка индексации венью: запись видна чтению с `time + lag` (у keeper'а — тот же замер)
+
+    def _send_tx(self, to, sig, args):
+        h = self.c.rpc("eth_sendTransaction", {"from": self.c.me, "to": to, "data": ABI.encode_call(sig, args),
+                                               "gas": hex(1_000_000)})
+        if int(self.c.receipt(h)["status"], 16) != 1:
+            raise ValueError(f"стенд: {sig} отклонён")
+
+    def bal(self, a) -> int:
+        out = ABI.hexbytes(self.c.rpc("eth_call", {"to": self.pc["SPOT_BALANCE_PRECOMPILE_ADDRESS"],
+                                                   "data": "0x" + ABI.encode(["address", "uint64"], [a, 0]).hex()}, "latest"))
+        return ABI.decode(["uint64", "uint64", "uint64"], out)[0]
+
+    def set_bal(self, a, wei):
+        self._send_tx(self.pc["SPOT_BALANCE_PRECOMPILE_ADDRESS"], "setBal(address,uint64,uint64)", [a, 0, wei])
+
+    def activate(self, a):
+        self._send_tx(self.pc["CORE_USER_EXISTS_PRECOMPILE_ADDRESS"], "setExists(address,bool)", [a, True])
+
+    def leg_value(self, leg) -> Decimal:
+        return self.perp[leg] + sum((q * self.px[c] for (l, c), q in self.pos.items() if l == leg), Decimal(0))
+
+    def sync_perp(self):
+        """Стоимость, вывод, позиции ног и марки — в моки прекомпайлов (то, что видит контракт и keeper)."""
+        for leg in self.legs:
+            v = self.leg_value(leg); used = sum((abs(q) * self.px[c] for (l, c), q in self.pos.items() if l == leg),
+                                                Decimal(0))
+            self._send_tx(self.pc["ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS"], "setAv(address,int64)", [leg, LB.micro(v)])
+            self._send_tx(self.pc["WITHDRAWABLE_PRECOMPILE_ADDRESS"], "setW(address,uint64)", [leg, max(0, LB.micro(v - used))])
+            for c, a in ASSETS.items():
+                q = self.pos.get((leg, c), Decimal(0))
+                self._send_tx(self.pc["POSITION2_PRECOMPILE_ADDRESS"], "setSzi(address,uint32,int64)",
+                              [leg, a["index"], int(q.scaleb(a["sz_decimals"]))])
+        for c, px in self.px.items():
+            a = ASSETS[c]
+            self._send_tx(self.pc["MARK_PX_PRECOMPILE_ADDRESS"], "setPx(uint32,uint64)",
+                          [a["index"], int(px.scaleb(VK.PERP_PX_DECIMALS - a["sz_decimals"]))])
+
+    def _rec(self, frm, to, wei, t=None):
+        amt = Decimal(wei) / 10 ** 8
+        rec = {"time": int(self.clock["t"] if t is None else t), "hash": "0x" + secrets.token_hex(32),
+               "delta": {"type": "spotTransfer", "user": frm.lower(), "destination": to.lower(), "token": "USDC",
+                         "amount": str(amt), "usdcValue": str(amt), "fee": "0.0", "nativeTokenFee": "0.0"}}
+        if self.vault in (frm.lower(), to.lower()):
+            self.ledger.append(rec)
+        return rec
+
+    def send(self, frm, to, usd: int, typ="spotTransfer") -> dict:
+        """`Send` USDC spot с Core-счёта на Core-счёт + запись леджера (форма — замер testnet 17.10, S1). typ="send" —
+        форма sendAsset, которой пришёл реальный депозит прода 20.07 (`cashflow`)."""
+        wei = usd * 10 ** 8
+        if self.bal(frm) < wei:
+            raise ValueError("стенд: у отправителя нет денег")
+        self.set_bal(frm, self.bal(frm) - wei); self.set_bal(to, self.bal(to) + wei)
+        self.clock["t"] += 1_000
+        rec = self._rec(frm, to, wei)
+        if typ == "send":
+            d = rec["delta"]
+            rec["delta"] = {"type": "send", "user": d["user"], "destination": d["destination"], "sourceDex": "spot",
+                            "destinationDex": "spot", "token": "USDC", "amount": d["amount"], "usdcValue": d["amount"],
+                            "fee": "0.0", "nativeTokenFee": "0.0", "nonce": self.clock["t"]}
+        return rec
+
+    def fund(self, leg, coin, usdc: str):
+        """Начисление funding ноге (`userFunding`): perp ноги и запись венью (хеш funding у венью — нули). Funding венью
+        начисляется РОВНО на границе часа (`VK.FUNDING_PERIOD_MS`) — на этом стоит судья funding-часа сверки keeper'а."""
+        if self.clock["t"] % VK.FUNDING_PERIOD_MS:
+            raise ValueError(f"стенд: funding вне границы часа ({self.clock['t']}) — у венью так не бывает")
+        self.perp[leg] += Decimal(usdc)
+        self.funding[leg].append({"time": int(self.clock["t"]), "hash": VK.ZERO_HASH, "delta": {
+            "type": "funding", "coin": coin, "usdc": usdc, "szi": str(self.pos.get((leg, coin), 0)), "fundingRate": "0.0001"}})
+        self.sync_perp()
+
+    def apply_actions(self):
+        """Действия CoreWriter исполняются ПОСЛЕ блока (interaction-timings HL); молчаливый отказ — без следа на цепи."""
+        head = int(self.c.rpc("eth_blockNumber"), 16)
+        if head <= self.last_block:
+            return
+        logs = self.c.rpc("eth_getLogs", {"fromBlock": hex(self.last_block + 1), "toBlock": hex(head),
+                                          "address": CORE_WRITER, "topics": [ABI.topic("RawAction(address,bytes)")]})
+        self.last_block = head; perp_moved = False
+        for lg in logs:
+            sender = ABI.dec_word("address", ABI.hexbytes(lg["topics"][1])).lower()
+            raw = ABI.hexbytes(lg["data"]); n = int.from_bytes(raw[32:64], "big"); act = raw[64:64 + n]
+            kind = int.from_bytes(act[1:4], "big")
+            if act[0] != 1 or kind not in (SPOT_SEND_ACTION, USD_CLASS_ACTION):
+                raise ValueError(f"стенд: действие CoreWriter {act[:4].hex()} не моделируется")
+            if kind == SPOT_SEND_ACTION:
+                to, token, wei = ABI.decode(["address", "uint64", "uint64"], act[4:])
+                if self.silent_reject or self.bal(sender) < wei:
+                    self.rejected.append((sender, to, wei)); continue
+                self.set_bal(sender, self.bal(sender) - wei); self.set_bal(to, self.bal(to) + wei)
+                # действие CoreWriter исполняется ПОСЛЕ блока: время записи Core не раньше метки блока
+                bts = int(self.c.rpc("eth_getBlockByNumber", lg["blockNumber"], False)["timestamp"], 16) * 1000
+                self.clock["t"] += 1; self._rec(sender, to, wei, t=max(self.clock["t"], bts))
+            else:
+                ntl, to_perp = ABI.decode(["uint64", "bool"], act[4:])
+                if sender not in self.perp:
+                    raise ValueError(f"стенд: usdClassTransfer не с ноги ({sender})")
+                if to_perp:
+                    self.set_bal(sender, self.bal(sender) - ntl * 100); self.perp[sender] += Decimal(ntl) / 10 ** 6
+                else:
+                    self.perp[sender] -= Decimal(ntl) / 10 ** 6; self.set_bal(sender, self.bal(sender) + ntl * 100)
+                perp_moved = True
+        if perp_moved:
+            self.sync_perp()
+
+    def trade(self, leg, coin, side, sz, px, fee, cloid=None):
+        s = LB.SIDE_OF[side]; sz = Decimal(sz); px = Decimal(px); fee = Decimal(fee)
+        self.clock["t"] += 1
+        self.perp[leg] += -s * sz * px - fee; self.pos[(leg, coin)] = self.pos.get((leg, coin), Decimal(0)) + s * sz
+        self.n_tid += 1
+        f = {"coin": coin, "px": str(px), "sz": str(sz), "side": side, "time": int(self.clock["t"]), "fee": str(fee),
+             "feeToken": "USDC", "tid": self.n_tid, "oid": self.n_tid, "hash": "0x" + secrets.token_hex(32), "dir": "x",
+             "closedPnl": "0", "crossed": True, "startPosition": "0"}
+        if cloid:
+            f["cloid"] = cloid
+        self.fills[leg].append(f); self.sync_perp()
+
+    def post(self, payload, weight=None, lane=None):
+        t = payload["type"]
+
+        def seen(r):
+            return payload["startTime"] <= r["time"] <= self.clock["t"] - self.lag
+        if t == "userNonFundingLedgerUpdates":
+            if payload["user"] != self.vault:
+                raise ValueError(f"стенд: леджер чужого адреса {payload['user']}")
+            return [r for r in self.ledger if seen(r)]
+        if t == "userFillsByTime":
+            return [f for f in self.fills[payload["user"]] if seen(f)]
+        if t == "userFunding":
+            return [f for f in self.funding[payload["user"]] if seen(f)]
+        if t == "userRole":
+            return {"role": "user"}
+        if t == "userAbstraction":
+            return self.modes.get(payload["user"].lower(), "default")    # режим счёта (R3-M); стенд его меняет руками
+        raise ValueError(f"стенд: info {t}")
+
+
+def deploy(chain, impl, keeper_addr, treasury, buffer_bps):
+    pv = art("PoolVault.sol", "PoolVault")
+    ctor = ABI.encode(["address"] + ["uint256"] * 6 + ["address"] * 4,
+                      [treasury, buffer_bps, 5000, 2000, 3500, 200, 52, impl["views"], impl["monday"], chain.me, keeper_addr])
+    rc = chain.receipt(chain.rpc("eth_sendTransaction", {"from": chain.me, "data": pv["bytecode"]["object"] + ctor.hex(),
+                                                         "gas": hex(D.GAS)}))
+    if int(rc["status"], 16) != 1:
+        raise ValueError("деплой PoolVault не прошёл")
+    vault = rc["contractAddress"]
+    get = lambda sig: ABI.decode(["address"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+        sig, [])}, "latest")))[0]
+    return vault, [get("legA()").lower(), get("legB()").lower()], get("ledger()")
+
+
+def boot():
+    """Сборка, цепь anvil, моки прекомпайлов и CoreWriter по адресам HLConstants, реализации views/monday бухгалтерии.
+    -> (chain, impl, pc). Общая точка входа стендов пула (keeper'а и сторожа `vault_watch_stand`)."""
+    D.build()
+    pv = art("PoolVault.sol", "PoolVault"); views = art("PoolLedger.sol", "PoolLedgerViews")
+    monday = art("PoolLedger.sol", "PoolLedgerMonday")
+    mocks = {n: art("CoreMocks.sol", n) for n in list(MOCKS) + ["CoreWriterMock"]}
+    for call, sig in VK.CONTRACT_SIGS.items():
+        # необязательный вызов (refundDeposit, C2) в этой редакции контракта может отсутствовать: его судит
+        # `EvmVaultClient.supports` по коду, стенд возврата и окон ног — vault_rev9_stand (контракт ea165ccd)
+        # (внеочередной расчёт ред. 9.5 — тоже необязательный: `supports` по коду)
+        if sig is not None and call not in VK.OPTIONAL_CALLS + VK.EXTRA_SETTLE_CALLS \
+                and ABI.selector(sig) not in pv["methodIdentifiers"].values():
+            raise ValueError(f"селектор {sig} keeper'а не найден в ABI PoolVault — сигнатуры разошлись")
+    pc = {k: E96.hl_constant_address(k) for k in VK.PRECOMPILES}
+    chain = D.Chain()
+    try:
+        for name, key in MOCKS.items():
+            chain.rpc("anvil_setCode", pc[key], mocks[name]["deployedBytecode"]["object"])
+        chain.rpc("anvil_setCode", CORE_WRITER, mocks["CoreWriterMock"]["deployedBytecode"]["object"])
+        impl = {}
+        for name, a in (("views", views), ("monday", monday)):
+            rc = chain.receipt(chain.rpc("eth_sendTransaction", {"from": chain.me, "data": a["bytecode"]["object"],
+                                                                 "gas": hex(D.GAS)}))
+            impl[name] = rc["contractAddress"]
+    except BaseException:
+        chain.close()
+        raise
+    return chain, impl, pc
+
+
+def run() -> int:
+    from eth_account import Account
+    ok = []
+
+    def chk(name, cond, detail=""):
+        ok.append(bool(cond)); print(f"  [{'OK' if cond else 'FAIL'}] {name} {detail}")
+    chain, impl, pc = boot(); work = tempfile.mkdtemp(prefix="vault_keeper_stand_")
+    try:
+        keeper = Account.create(); signer = RPC.Signer(keeper)
+        chain.rpc("anvil_setBalance", signer.address, hex(10 ** 20))
+        treasury = Account.create().address; inv_a = Account.create().address; stranger = Account.create().address
+        # первый деплой — срез зачислений и выплат: буфер 100 % (раздачи нет — деньги остаются на хранилище)
+        vault, legs, ledger = deploy(chain, impl, signer.address, treasury, 10_000)
+        # часы стенда — от времени цепи (блоки ST3 ставятся по ним: метка блока — нижняя граница записи Core о действии),
+        # и ниже часов потока беты (2027-W02): время блока назад не идёт
+        clock = {"t": (int(chain.rpc("eth_getBlockByNumber", "latest", False)["timestamp"], 16) + 1) * 1000}
+        now = lambda: clock["t"]
+        core = Core(chain, vault, legs, pc, clock)
+        for a in [vault] + legs + [inv_a, treasury]:
+            core.activate(a)
+        core.set_bal(inv_a, 500 * 10 ** 8)
+
+        def make_keeper(sub, fresh_journal, *, vault_=None, core_=None, legs_=None, first_iso="2099-W01",
+                        outbox_=None, signer_=None, now=now, lag=0):
+            vault_ = vault_ or vault; core_ = core_ or core; legs_ = legs_ or legs; signer_ = signer_ or signer
+            rpc = RPC.EvmRpc(RPC.HttpTransport(chain.url, timeout_s=30.0), expected_chain_id=chain.chain_id,
+                             limiter=RPC.Limiter(os.path.join(work, "evm_state"), RPC.scope_slug(chain.url, None), 60000,
+                                                 max_wait_s=60.0))
+            j = RPC.NonceJournal(os.path.join(work, sub, "nonce_journal.jsonl"), now_ms=now)
+            if fresh_journal:
+                j.init(signer_.address, chain.chain_id, rpc.tx_count(signer_.address, "latest"))
+            tx = RPC.TxManager(rpc, signer_, j); tx.startup()
+            client = VK.EvmVaultClient(tx, rpc, vault_, pc, mine_wait_s=10.0)
+            led = VK.CoreLedger(vault_, os.path.join(work, sub, "core.jsonl"), start_ms=0, index_lag_ms=lag,
+                                lane="observability", post=core_.post, now_ms=now)
+            fx = {legs_[0]: VK.VenueFacts(legs_[0], os.path.join(work, sub, "factsA.jsonl"), start_ms=0, index_lag_ms=lag,
+                                          lane="observability", post=core_.post, now_ms=now)}
+            rd = {legs_[0]: OB.OutboxReader(outbox_ or outbox_path, os.path.join(work, sub, "outA.cur"), legs_[0])}
+            k = VK.VaultKeeper(client=client, core=led, outboxes=rd, facts=fx, vault=vault_, legs=legs_, treasury=treasury,
+                               min_deposit_micro=10 * VK.MICRO, min_payout_micro=10 * VK.MICRO,
+                               role_of=lambda a: core_.post({"type": "userRole", "user": a})["role"],
+                               data_dir=os.path.join(work, sub), ttl_out_ms=10 ** 9, fence_window_ms=30_000,
+                               confirm_window_ms=600_000, mark_max_age_ms=3_600_000, assets=ASSETS,
+                               capital_paths={legs_[0]: os.path.join(work, sub, "capA.json")}, capital_ttl_ms=3_600_000,
+                               monday_timer_path=TIMER, first_settle_iso_week=first_iso, now_ms=now,
+                               mode_of=lambda a: core_.post({"type": "userAbstraction", "user": a}),
+                               start_threshold_micro=1, alloc_frac=0.6)
+            return k, tx, rpc
+        outbox_path = os.path.join(work, "outA.jsonl"); W = OB.OutboxWriter(outbox_path, legs[0])
+
+        def view(sig, args, n, to=None):
+            return ABI.dec_fixed(ABI.hexbytes(chain.rpc("eth_call", {"to": to or ledger, "data": ABI.encode_call(sig, args)},
+                                                        "latest")), n)
+
+        # --- ST1: зачисление --- #
+        k, tx, rpc = make_keeper("k1", True)
+        rec = core.send(inv_a, vault, 100); clock["t"] = rec["time"] + 1; W.hb(rec["time"] + 1)
+        nonce0 = rpc.tx_count(signer.address, "latest"); k.step()
+        ref = VK.row_ref({"rec": rec}); op = tx.j.ops[f"credit:{ref}"]
+        inv = view("investorView(address)", [inv_a], 11); st = view("status()", [], 13)
+        rcn = (core.bal(vault) // 100, st[7] + st[8])
+        chk("ST1a: Send -> creditDeposit(отправитель, сумма, ledgerRef = keccak(hash‖time) записи) замайнен и проверен",
+            k.decisions[ref]["status"] == "credited" and tx.state(f"credit:{ref}") == "verified")
+        chk("ST1b: бухгалтерия: deposited инвестора = 100e6; Core хранилища = spot+evm бухгалтерии = 100e6",
+            inv[0] == 100 * VK.MICRO and rcn[0] == rcn[1] == 100 * VK.MICRO, f"investorView[0]={inv[0]} core/held={rcn}")
+        gas_used = int(chain.rpc("eth_getTransactionReceipt", op["mined"]["hash"])["gasUsed"], 16)
+        chk("ST1c: газ зачисления помещается в малый блок", gas_used <= SMALL_BLOCK_GAS, f"gasUsed={gas_used}")
+        chk("ST1d: ключ keeper'а не в журналах (только адрес)",
+            keeper.key.hex().removeprefix("0x") not in open(tx.j.path, encoding="utf-8").read().lower())
+
+        # --- ST2: повтор ledgerRef --- #
+        core.ledger.append(dict(rec)); clock["t"] += 1_000; W.hb(clock["t"]); k.step()
+        chk("ST2a: та же запись венью ещё раз — ни одной транзакции", rpc.tx_count(signer.address, "latest") == nonce0 + 1)
+        k.close(); tx.close()
+        k2, tx2, rpc2 = make_keeper("k2_lost", True)          # журналы потеряны, оператор переинициализировал ключ
+        clock["t"] += 1_000; W.hb(clock["t"]); k2.step()
+        chk("ST2b: журналы потеряны -> ledger_ref used -> DepositCredited(ref) того же адреса на цепи -> credited_by_chain, "
+            "второго зачисления нет",
+            k2.decisions[ref]["status"] == "credited_by_chain" and rpc2.tx_count(signer.address, "latest") == nonce0 + 1
+            and view("investorView(address)", [inv_a], 11)[0] == 100 * VK.MICRO)
+        why = k2.client.simulate("creditDeposit", [inv_a, 100 * VK.MICRO, ABI.hexbytes(ref)])
+        chk("ST2c: прямая симуляция повтора на настоящем контракте — Revert(ledger_ref used)",
+            why and why["name"] == "Revert" and why["args"] == [VK.LEDGER_REF_USED], str(why))
+
+        # --- ST3: выплата --- #
+        k = k2; tx = tx2; rpc = rpc2
+        chain.rpc("anvil_impersonateAccount", inv_a); chain.rpc("anvil_setBalance", inv_a, hex(10 ** 20))
+        h = chain.rpc("eth_sendTransaction", {"from": inv_a, "to": vault, "data": ABI.encode_call(
+            "requestWithdraw(uint256,bool)", [40 * VK.MICRO, False]), "gas": hex(1_000_000)})
+        chk("ST3a: заявка инвестора принята", int(chain.receipt(h)["status"], 16) == 1)
+        m = k.client.execute("pw:0", "processWithdrawals", [1])
+        proc = [ABI.decode_log(lg, "WithdrawProcessed(uint256,int256,int256)", [True, False, False])["args"]
+                for lg in m["logs"] if lg["topics"][0].lower() == ABI.topic("WithdrawProcessed(uint256,int256,int256)")]
+        chk("ST3b: processWithdrawals исполнил заявку", m["status"] == 1 and proc and proc[0][1] > 0, f"{proc}")
+        before = core.bal(inv_a)
+        chain_time(chain, clock)                   # время блока = часы стенда (у боевого keeper'а — общие часы HL)
+        res = k.pay(inv_a); core.apply_actions(); clock["t"] += 1_000; W.hb(clock["t"]); k.step()
+        chk("ST3c: claimFor -> Paid; выплата подтверждена ИСХОДЯЩЕЙ записью Core хранилища (адресат, сумма)",
+            res.get("paid_micro") == proc[0][1] and core.bal(inv_a) == before + res["paid_micro"] * 100
+            and k.payouts[res["op_id"]]["status"] == "verified", f"{res}")
+        n_before = rpc.tx_count(signer.address, "latest")
+        chk("ST3d: неактивированный адрес — отказ без транзакции",
+            k.pay(stranger) == {"refused": "not_activated"} and rpc.tx_count(signer.address, "latest") == n_before)
+        h = chain.rpc("eth_sendTransaction", {"from": inv_a, "to": vault, "data": ABI.encode_call(
+            "requestWithdraw(uint256,bool)", [20 * VK.MICRO, False]), "gas": hex(1_000_000)})
+        chain.receipt(h); k.client.execute("pw:1", "processWithdrawals", [1])
+        chain_time(chain, clock); core.silent_reject = True; res2 = k.pay(inv_a); core.apply_actions()
+        core.set_bal(inv_a, core.bal(inv_a) + 20 * 10 ** 8)     # получателю пришли ЧУЖИЕ 20: по балансу «подтвердилось» бы
+        clock["t"] += 1_000; W.hb(clock["t"]); k.step()
+        chk("ST3e: молчаливый отказ CoreWriter: receipt 1, записи Core нет — НЕ подтверждено (чужой приход не в счёт)",
+            k.payouts[res2["op_id"]]["status"] == "pending" and core.rejected
+            and int(chain.rpc("eth_getTransactionReceipt", tx.j.ops[res2["op_id"]]["mined"]["hash"])["status"], 16) == 1)
+        clock["t"] += 700_000; W.hb(clock["t"]); k.step()
+        chk("ST3f: за окно подтверждения — стоп денежных операций", bool(k.money_blocked())
+            and k.payouts[res2["op_id"]]["status"] == "unconfirmed")
+        core.silent_reject = False
+
+        # --- ST4: транзакция с ключа мимо журнала --- #
+        raw, _ = signer.sign({"nonce": rpc.tx_count(signer.address, "pending"), "gasPrice": rpc.gas_price(), "gas": 21_000,
+                              "to": treasury, "value": 0, "data": b"", "chainId": chain.chain_id})
+        rpc.send_raw(raw); time.sleep(0.2)
+        try:
+            clock["t"] += 1_000; W.hb(clock["t"]); k.step(); caught = False   # сверка журнала — каждый шаг keeper'а
+        except RPC.ForeignTransaction:
+            caught = True
+        chk("ST4: транзакция с ключа keeper'а вне журнала на настоящей цепи -> ForeignTransaction", caught)
+        k.close(); tx.close(); W.close()
+
+        # ================= поток беты: второй деплой, свой ключ, свой журнал ноги ================= #
+        flow(chain, impl, pc, work, chk, Account, treasury, make_keeper, view)
+        # ================= третий деплой: находки ревью (send, задержка индексации, funding, потеря журнала nonce
+        # после КАЖДОЙ денежной операции, V7 на настоящем контракте, недостача G1) ================= #
+        flow2(chain, impl, pc, work, chk, Account, treasury, make_keeper, view)
+    finally:
+        chain.close()
+    n = len(ok); p = sum(ok)
+    print(f"STAND: {'PASS' if p == n else 'FAIL'} ({p}/{n})")
+    return 0 if p == n else 1
+
+
+def flow(chain, impl, pc, work, chk, Account, treasury, make_keeper, view):
+    keeper = Account.create(); signer = RPC.Signer(keeper)
+    chain.rpc("anvil_setBalance", signer.address, hex(10 ** 20))
+    vault, legs, ledger = deploy(chain, impl, signer.address, treasury, 1_000)
+    t0 = int(datetime(2027, 1, 13, 12, tzinfo=timezone.utc).timestamp() * 1000)      # среда ISO 2027-W02
+    clk = {"t": t0}
+    core = Core(chain, vault, legs, pc, clk)
+    core.last_block = int(chain.rpc("eth_blockNumber"), 16)       # действия первого деплоя — не этого «Core»
+    inv = Account.create().address
+    for a in [vault] + legs + [inv, treasury]:
+        core.activate(a)
+    core.set_bal(inv, 1_000 * 10 ** 8); core.px.update(BTC=Decimal(50000), ETH=Decimal(2500)); core.sync_perp()
+    outbox = os.path.join(work, "flow_outA.jsonl"); W = OB.OutboxWriter(outbox, legs[0])
+    st = {"k": None, "tx": None, "rpc": None}
+
+    def keeper_(fresh):
+        st["k"], st["tx"], st["rpc"] = make_keeper("flow", fresh, vault_=vault, core_=core, legs_=legs, first_iso="2027-W03",
+                                                   outbox_=outbox, signer_=signer, now=lambda: clk["t"])
+
+    def restart():
+        st["k"].close(); st["tx"].close(); keeper_(False)
+
+    def step(n=1, hb=True):
+        rep = None
+        for _ in range(n):
+            clk["t"] += 1_000; chain_time(chain, clk)          # часы могли догнать цепь — hb уже по ним
+            if hb:
+                W.hb(clk["t"])
+            rep = st["k"].step(); clk["t"] += 1; core.apply_actions()
+        return rep
+
+    def order(pid):
+        return st["k"].client.dump()["orders"].get(pid)
+
+    def txs():
+        return st["rpc"].tx_count(signer.address, "latest")
+
+    def gas_ok():
+        worst = 0
+        for op in st["tx"].j.ops.values():
+            if op["mined"]:
+                worst = max(worst, int(chain.rpc("eth_getTransactionReceipt", op["mined"]["hash"])["gasUsed"], 16))
+        return worst
+    keeper_(True)
+    L = lambda: st["k"]
+    # ST5: депозит -> раздача ногам (буфер 10 %): sweepToLegs -> spot ног -> legToPerp
+    clk["t"] += 10; core.send(inv, vault, 300); step(3)
+    chk("ST5: депозит зачислен; раздача 270 = 300 − буфер: ноги получили 135/135 на perp (по прекомпайлу)",
+        core.perp[legs[0]] == Decimal(135) and core.perp[legs[1]] == Decimal(135) and L().sw is None,
+        f"perp {core.perp} sw {L().sw}")
+    # ST6: вход -> филл -> марк; падение после подписи sizeOrder до квитанции
+    clk["t"] += 10; t_d = clk["t"]
+    W.write("size", t_d, copy_id="c1", coin="BTC", side=1, notional_micro=100 * VK.MICRO, leg_seq=0, cloid="0x" + "1" * 32)
+    pid = VK.pid_of(legs[0], "c1", 0, 0)
+    orig_poll = RPC.TxManager.poll
+
+    def crash_poll(self_, op_id):
+        if "sizeOrder" in op_id:
+            RPC.TxManager.poll = orig_poll; raise Crash("sizeOrder подписан и отправлен, квитанции не видели")
+        return orig_poll(self_, op_id)
+    RPC.TxManager.poll = crash_poll
+    n0 = txs()
+    try:
+        step(); crashed = False
+    except Crash:
+        crashed = True
+    finally:
+        RPC.TxManager.poll = orig_poll
+    restart(); step()
+    chk("ST6a: падение между подписью sizeOrder и квитанцией: рестарт (тот же raw), ордер один, транзакция одна",
+        crashed and order(pid) is not None and order(pid)[1] == 1 and txs() == n0 + 1, f"{order(pid)} tx {txs() - n0}")
+    core.trade(legs[0], "BTC", "B", "0.002", "50000", "0.05", "0x" + "1" * 32); step()
+    o = order(pid)
+    chk("ST6b: первый филл входа -> fillOrder; марк = −комиссия (−50000 микро) на настоящем PoolLedger",
+        o is not None and o[1] == 2 and o[3] == -50_000, f"{o}")
+    core.px["BTC"] = Decimal(51000); core.sync_perp(); step()
+    chk("ST6c: цена 51000 -> markPosition изменившегося pid (1.95 USDC)", order(pid)[3] == 1_950_000, f"{order(pid)}")
+    # ST7: выход -> closePosition; падение после майнинга до op_done
+    clk["t"] += 10
+    W.write("exit_bind", clk["t"], cloid="0x" + "2" * 32, parent_cloid=None, copies=[{"copy_id": "c1", "qty": "0.002"}])
+    core.trade(legs[0], "BTC", "A", "0.002", "52000", "0.052", "0x" + "2" * 32)
+    orig_done = VK.VaultKeeper._done
+
+    def crash_done(self_, op_id, how, **kw):
+        if self_.ops[op_id]["call"] == "closePosition":
+            VK.VaultKeeper._done = orig_done; raise Crash("closePosition замайнен, op_done не записан")
+        return orig_done(self_, op_id, how, **kw)
+    VK.VaultKeeper._done = crash_done
+    n0 = txs()
+    try:
+        step(); crashed = False
+    except Crash:
+        crashed = True
+    finally:
+        VK.VaultKeeper._done = orig_done
+    restart(); step()
+    dump = L().client.dump()
+    chk("ST7: выход -> closePosition(0.002·2000 − 0.102 = 3.898); падение после майнинга: повтор без второй транзакции",
+        crashed and pid in dump["closed_pids"] and DUMP_R(dump) == 3_898_000 and txs() == n0 + 1,
+        f"rAll {DUMP_R(dump)} tx {txs() - n0}")
+    # ST8: сверка §3.8 на настоящем reconcile() + прекомпайлах (время блока — часы стенда: судья funding-часа их сверяет)
+    chain_time(chain, clk); rc = L().reconcile()
+    chk("ST8: сверка: ноги (прекомпайл) + деньги ног на хранилище = venueCash + rAll + лоты; G1 точно", rc["judged"]
+        and rc["ok"], f"{rc}")
+    # ST9: понедельник по расписанию рескора: атомарный monday() -> treasuryPayout; барьер; падение после monday()
+    T = int(datetime(2027, 1, 18, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    clk["t"] = T - 120_000; step()
+    clk["t"] = T + 30 * 60_000
+    W.write("size", clk["t"] + 1, copy_id="c2", coin="ETH", side=1, notional_micro=50 * VK.MICRO, leg_seq=0,
+            cloid="0x" + "3" * 32)
+    pid2 = VK.pid_of(legs[0], "c2", 0, 0)
+    VK.VaultKeeper._done = lambda self_, op_id, how, **kw: (
+        (setattr(VK.VaultKeeper, "_done", orig_done), (_ for _ in ()).throw(Crash("monday() замайнен")))
+        if self_.ops[op_id]["call"] == "monday" else orig_done(self_, op_id, how, **kw))
+    try:
+        step(); crashed = False
+    except Crash:
+        crashed = True
+    finally:
+        VK.VaultKeeper._done = orig_done
+    sized_before = order(pid2) is not None
+    restart(); rep9 = step()
+    s_ = view("status()", [], 13, to=ledger)
+    chk("ST9a: monday() по расписанию hl-followk-weekly: week 1, расчёт закрыт; падение после monday() — повтор "
+        "идемпотентен по week; решение после T_пн до расчёта не легло", crashed and not sized_before and s_[1] == 1
+        and s_[11] == 0 and L().monday_st.get("2027-W03") == "done", f"status {s_[:12]} {L().monday_st} {rep9}")
+    calls = [o["call"] for o in sorted(L().ops.values(), key=lambda o: int(o["op_id"][1:].split(":")[0]))]
+    sent = [o["planned"]["purpose"] for o in st["tx"].j.ops.values()]
+    chk("ST9b: пакет понедельника: setWithdrawable -> monday(); затем отдельным пакетом setWithdrawable -> treasuryPayout "
+        "(уже равный withdrawable — по автомату, без транзакции)",
+        _subseq(calls, ["setWithdrawable", "monday", "setWithdrawable", "treasuryPayout"])
+        and _subseq(sent, ["monday", "treasuryPayout"]), f"{calls[-6:]} / {sent[-4:]}")
+    step()
+    chk("ST9c: после расчёта барьер снят — решение после T_пн исполнено", order(pid2) is not None)
+    # ST10: заявка инвестора -> вывод с ног -> приход -> setWithdrawable -> processWithdrawals -> claimFor; падение между
+    # legToSpot и legSendToVault
+    chain.rpc("anvil_impersonateAccount", inv); chain.rpc("anvil_setBalance", inv, hex(10 ** 20))
+    h = chain.rpc("eth_sendTransaction", {"from": inv, "to": vault, "data": ABI.encode_call(
+        "requestWithdraw(uint256,bool)", [80 * VK.MICRO, False]), "gas": hex(1_000_000)})
+    chain.receipt(h)
+    W.write("entry_done", clk["t"] + 5, copy_id="c2", leg_seq=0, sized_qty="0.02", filled_qty="0", reason="ttl")
+    before = core.bal(inv)
+    orig_exec = VK.EvmVaultClient.execute
+
+    def crash_send(self_, op_id, call, args):
+        if call == "legSendToVault":
+            VK.EvmVaultClient.execute = orig_exec; raise Crash("между legToSpot и legSendToVault")
+        return orig_exec(self_, op_id, call, args)
+    VK.EvmVaultClient.execute = crash_send
+    crashed = False
+    try:
+        for _ in range(6):
+            try:
+                step()
+            except Crash:
+                crashed = True; VK.EvmVaultClient.execute = orig_exec; restart()
+        step(4)
+    finally:
+        VK.EvmVaultClient.execute = orig_exec
+    paid = [p for p in L().payouts.values() if p["addr"] == inv.lower()]
+    nxt = ABI.decode(["uint256"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+        "nextIntent()", [])}, "latest")))[0]
+    chk("ST10: заявка 80 -> вывод с ног (падение посреди, рестарт) -> processWithdrawals -> claimFor(inv), "
+        "подтверждено прекомпайлом", crashed and nxt == 1 and paid and paid[-1]["status"] == "verified"
+        and core.bal(inv) == before + paid[-1]["paid_micro"] * 100, f"next {nxt} paid {paid} wd {L().wd}")
+    chain_time(chain, clk); rc = L().reconcile()
+    chk("ST11: сверка после выплаты — в допуске", rc["judged"] and rc["ok"], f"{rc}")
+    cap = json.load(open(os.path.join(work, "flow", "capA.json"), encoding="utf-8"))
+    chk("ST12a: артефакт капитала ноги: схема §4.2, адрес и номер ноги, sizingCapital контракта",
+        cap["schema"] == VK.CAPITAL_SCHEMA and cap["leg_address"] == legs[0] and cap["leg_index"] == 0
+        and cap["sizing_capital_micro"] == ABI.decode(["int256"], ABI.hexbytes(chain.rpc("eth_call", {
+            "to": ledger, "data": ABI.encode_call("sizingCapital()", [])}, "latest")))[0], f"{cap}")
+    worst = gas_ok()
+    chk("ST12b: каждая транзакция потока помещается в малый блок (N = 1)", 0 < worst <= SMALL_BLOCK_GAS, f"max gas {worst}")
+    st["k"].close(); st["tx"].close(); W.close()
+
+
+def flow2(chain, impl, pc, work, chk, Account, treasury, make_keeper, view):
+    """Третий деплой, свой ключ и журнал. Задержка индексации венью НЕНУЛЕВАЯ (запись Core, филл и funding видны
+    чтению спустя LAG, у keeper'а тот же замер). Каждая денежная операция один раз «теряется»: замайнена -> keeper
+    падает -> журнал nonce ПОТЕРЯН (оператор переинициализировал ключ) -> рестарт. Судится: ни одной лишней транзакции
+    этой операции, исход тот же, стопа нет (идемпотентность по состоянию контракта, а не по журналу)."""
+    LAG = 1_500
+    keeper = Account.create(); signer = RPC.Signer(keeper)
+    chain.rpc("anvil_setBalance", signer.address, hex(10 ** 20))
+    vault, legs, ledger = deploy(chain, impl, signer.address, treasury, 1_000)
+    t0 = int(datetime(2027, 2, 10, 12, tzinfo=timezone.utc).timestamp() * 1000)      # среда ISO 2027-W06
+    clk = {"t": t0}
+    core = Core(chain, vault, legs, pc, clk); core.lag = LAG
+    core.last_block = int(chain.rpc("eth_blockNumber"), 16)
+    inv = Account.create().address
+    for a in [vault] + legs + [inv, treasury]:
+        core.activate(a)
+    core.set_bal(inv, 1_000 * 10 ** 8); core.px.update(BTC=Decimal(50000), ETH=Decimal(2500)); core.sync_perp()
+    sub = "flow2"; outbox = os.path.join(work, "flow2_outA.jsonl"); W = OB.OutboxWriter(outbox, legs[0])
+    jpath = os.path.join(work, sub, "nonce_journal.jsonl"); st = {}; lost = []; crashes = []; losing = set()
+
+    def keeper_(fresh):
+        st["k"], st["tx"], st["rpc"] = make_keeper(sub, fresh, vault_=vault, core_=core, legs_=legs, first_iso="2027-W07",
+                                                   outbox_=outbox, signer_=signer, now=lambda: clk["t"], lag=LAG)
+
+    def lose_journal():
+        st["k"].close(); st["tx"].close()
+        p = f"{jpath}.lost{len(lost)}"; os.replace(jpath, p); lost.append(p); keeper_(True)
+
+    def step(n=1):
+        for _ in range(n):
+            clk["t"] += 1_000; chain_time(chain, clk); W.hb(clk["t"])
+            st["k"].step(); clk["t"] += 1; core.apply_actions()
+
+    orig_exec = VK.EvmVaultClient.execute
+
+    def ex(self_, op_id, call, args):
+        m = orig_exec(self_, op_id, call, args)
+        if m is not None and m["status"] == 1 and call in losing:
+            losing.discard(call); raise Crash(call)
+        return m
+
+    def run(n):
+        VK.EvmVaultClient.execute = ex
+        try:
+            for _ in range(n):
+                try:
+                    step()
+                except Crash as e:
+                    crashes.append(str(e))
+                    core.apply_actions()             # Core исполняет действия замайненного блока и без keeper'а
+                    lose_journal()
+        finally:
+            VK.EvmVaultClient.execute = orig_exec
+
+    def sent(call, to=None):
+        """Сколько транзакций операции подписано за весь поток — по ВСЕМ журналам, включая потерянные; `to` — адресат
+        в данных вызова (claimFor инвестора отдельно от claimFor treasury)."""
+        n = 0
+        for p in lost + [jpath]:
+            j = RPC.NonceJournal(p)
+            n += sum(1 for op in j.ops.values() if op["planned"]["purpose"] == call and op["signed"]
+                     and (to is None or to[2:].lower() in op["planned"]["data"].lower()))
+        return n
+
+    def order(pid):
+        return st["k"].client.dump()["orders"].get(pid)
+
+    def incidents():
+        p = os.path.join(work, sub, "keeper_incidents.jsonl")
+        return [json.loads(l)["what"] for l in open(p, encoding="utf-8")] if os.path.exists(p) else []
+
+    def admin(sig, args, frm=None):
+        h = chain.rpc("eth_sendTransaction", {"from": frm or chain.me, "to": vault, "data": ABI.encode_call(sig, args),
+                                              "gas": hex(D.GAS)})
+        if int(chain.receipt(h)["status"], 16) != 1:
+            raise ValueError(f"стенд: {sig} отклонён")
+    keeper_(True)
+    # ST13: депозит формой `send` + раздача; журнал теряется после creditDeposit, sweepToLegs и первого legToPerp
+    losing |= {"creditDeposit", "sweepToLegs", "legToPerp"}
+    clk["t"] += 10; rec = core.send(inv, vault, 300, typ="send"); run(10)
+    ref = VK.row_ref({"rec": rec}); k = st["k"]
+    invv = view("investorView(address)", [inv], 11, to=ledger)
+    chk("ST13a: депозит формой send (реальный депозит прода 20.07) при задержке индексации зачислен отправителю",
+        invv[0] == 300 * VK.MICRO and k.decisions[ref]["kind"] == "credit", f"{invv[0]} {k.decisions[ref]}")
+    chk("ST13b: журнал nonce потерян после creditDeposit / sweepToLegs / legToPerp — ни одной лишней транзакции: "
+        "credited_by_chain по DepositCredited(ref) на цепи, раздача и перевод на perp узнаны по состоянию",
+        crashes == ["creditDeposit", "sweepToLegs", "legToPerp"] and k.decisions[ref]["status"] == "credited_by_chain"
+        and (sent("creditDeposit"), sent("sweepToLegs"), sent("legToPerp")) == (1, 1, 2)
+        and [core.perp[l] for l in legs] == [Decimal(135), Decimal(135)] and not k.money_blocked() and k.sw is None,
+        f"crashes {crashes} sent {[sent(c) for c in ('creditDeposit', 'sweepToLegs', 'legToPerp')]} perp {core.perp} "
+        f"halt {k.money_blocked()}")
+    # ST14: вход, funding копии, марк, выход в прибыль — при задержке индексации фактов
+    clk["t"] += 10; cl1 = "0x" + "a" * 32
+    W.write("size", clk["t"], copy_id="f1", coin="BTC", side=1, notional_micro=100 * VK.MICRO, leg_seq=0, cloid=cl1)
+    pid = VK.pid_of(legs[0], "f1", 0, 0)
+    core.trade(legs[0], "BTC", "B", "0.002", "50000", "0.05", cl1); step(3)
+    clk["t"] = (clk["t"] // VK.FUNDING_PERIOD_MS + 1) * VK.FUNDING_PERIOD_MS     # funding — на границе часа
+    core.fund(legs[0], "BTC", "-0.02"); core.px["BTC"] = Decimal(52000); core.sync_perp(); step(4)
+    o = order(pid); L = st["k"].book.lots.get(pid, {})
+    chk("ST14: funding ноги (userFunding) — в результат лота и в марк: 0.002·2000 − 0.05 − 0.02 = 3.93",
+        o is not None and o[1] == 2 and L.get("funding") == Decimal("-0.02") and o[3] == 3_930_000
+        and not st["k"].money_blocked(), f"{o} {L.get('funding')}")
+    clk["t"] += 10; cl2 = "0x" + "b" * 32
+    W.write("exit_bind", clk["t"], cloid=cl2, parent_cloid=None, copies=[{"copy_id": "f1", "qty": "0.002"}])
+    core.trade(legs[0], "BTC", "A", "0.002", "53000", "0.053", cl2); step(4)
+    chk("ST14b: выход в прибыль -> closePosition", pid in st["k"].client.dump()["closed_pids"])
+    # ST15: понедельник; журнал теряется после monday() и treasuryPayout
+    T = int(datetime(2027, 2, 15, 4, tzinfo=timezone.utc).timestamp() * 1000)
+    clk["t"] = T - 120_000; step(2); clk["t"] = T + 30 * 60_000
+    losing |= {"monday", "treasuryPayout"}; run(10)
+    s_ = view("status()", [], 13, to=ledger); k = st["k"]
+    chk("ST15: журнал nonce потерян после monday() и после treasuryPayout — повтор узнан по week и котлу treasury: "
+        "ровно по одному, расчёт недели закрыт, стопа нет",
+        crashes[-2:] == ["monday", "treasuryPayout"] and (sent("monday"), sent("treasuryPayout")) == (1, 1)
+        and s_[1] == 1 and s_[11] == 0 and k.monday_st.get("2027-W07") == "done" and not k.money_blocked(),
+        f"crashes {crashes} sent {(sent('monday'), sent('treasuryPayout'))} status {s_[:12]} {k.monday_st} "
+        f"halt {k.money_blocked()}")
+    # ST16: вывод; журнал теряется после processWithdrawals, legToSpot, legSendToVault, setWithdrawable, payQueue, claimFor
+    chain.rpc("anvil_impersonateAccount", inv); chain.rpc("anvil_setBalance", inv, hex(10 ** 20))
+    h = chain.rpc("eth_sendTransaction", {"from": inv, "to": vault, "data": ABI.encode_call(
+        "requestWithdraw(uint256,bool)", [100 * VK.MICRO, False]), "gas": hex(1_000_000)})
+    chain.receipt(h)
+    base = {c: sent(c) for c in ("processWithdrawals", "legToSpot", "legSendToVault", "payQueue")}
+    base["claimFor"] = sent("claimFor", to=inv)
+    d_sent = lambda c: (sent(c, to=inv) if c == "claimFor" else sent(c)) - base[c]
+    before = core.bal(inv); n_cr = len(crashes)
+    losing |= {"processWithdrawals", "legToSpot", "legSendToVault", "setWithdrawable", "payQueue", "claimFor"}
+    run(24)
+    k = st["k"]; paid = [p for p in k.payouts.values() if p["addr"] == inv.lower()]
+    nxt = ABI.decode(["uint256"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+        "nextIntent()", [])}, "latest")))[0]
+    chk("ST16: журнал nonce потерян после КАЖДОЙ операции вывода — без единой лишней транзакции: processWithdrawals 1 "
+        "(nextIntent), legToSpot/legSendToVault по одной на ногу (баланс и приход «с ноги»), claimFor 1 (снимок «к "
+        "получению»); заявка выплачена и подтверждена записью Core, стопа нет",
+        not losing and len(crashes) - n_cr >= 5 and nxt == 1 and d_sent("processWithdrawals") == 1
+        and d_sent("legToSpot") == 2 and d_sent("legSendToVault") == 2 and d_sent("claimFor") == 1
+        and d_sent("payQueue") <= 1 and paid and paid[-1]["status"] == "verified"
+        and core.bal(inv) == before + 100 * VK.MICRO * 100 and not k.money_blocked(),
+        f"left {losing} crashes {crashes[n_cr:]} next {nxt} sent {[d_sent(c) for c in base]} "
+        f"paid {paid} got {(core.bal(inv) - before) // 100} halt {k.money_blocked()} wd {k.wd}")
+    chain_time(chain, clk); rc = st["k"].reconcile()
+    chk("ST16b: сверка после потерь журнала — судима и в допуске", rc["judged"] and rc["ok"], f"{rc}")
+    # ST17 (V7): расчёт открылся между setWithdrawable и processWithdrawals — заявка не съедена
+    helper = Account.create().address
+    chain.rpc("anvil_impersonateAccount", helper); chain.rpc("anvil_setBalance", helper, hex(10 ** 20))
+
+    def as_helper(sig, args):
+        admin("setKeeper(address)", [helper]); admin(sig, args, frm=helper); admin("setKeeper(address)", [signer.address])
+    h = chain.rpc("eth_sendTransaction", {"from": inv, "to": vault, "data": ABI.encode_call(
+        "requestWithdraw(uint256,bool)", [20 * VK.MICRO, False]), "gas": hex(1_000_000)})
+    chain.receipt(h)
+    orig_run = VK.VaultKeeper._run_op; opened = []
+
+    def run_op(self_, op_id):
+        if self_.ops[op_id]["call"] == "processWithdrawals" and not opened:
+            opened.append(op_id); as_helper("mondayBegin()", [])     # расчёт открылся в окне пакета
+        return orig_run(self_, op_id)
+    VK.VaultKeeper._run_op = run_op
+    n_pw = sent("processWithdrawals")
+    try:
+        step(3)
+    finally:
+        VK.VaultKeeper._run_op = orig_run
+    nxt = ABI.decode(["uint256"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+        "nextIntent()", [])}, "latest")))[0]
+    chk("ST17 (V7): открытый расчёт на НАСТОЯЩЕМ контракте — processWithdrawals не позван, заявка цела (nextIntent 1), "
+        "инцидент", opened and nxt == 1 and sent("processWithdrawals") == n_pw
+        and "process_withdrawals_refused_monday_open" in incidents(), f"opened {opened} next {nxt}")
+    if opened:                                    # расчёт открыт стендом — стенд его и закрывает
+        as_helper("mondayStep(uint256)", [2 ** 256 - 1]); as_helper("mondayEnd()", [])
+    step(10)
+    nxt = ABI.decode(["uint256"], ABI.hexbytes(chain.rpc("eth_call", {"to": vault, "data": ABI.encode_call(
+        "nextIntent()", [])}, "latest")))[0]
+    chk("ST17b: расчёт закрыт — та же заявка исполнена", nxt == 2, f"next {nxt} wd {st['k'].wd} "
+                                                                 f"halt {st['k'].money_blocked()}")
+    # ST18: недостача G1 на настоящем reconcile() — R3-T ревью-3: в пределах окна подтверждения — инцидент и повтор
+    # (видимость действия CoreWriter в b+1 на mainnet не замерена), дольше окна — стоп денежных операций
+    core.set_bal(vault, core.bal(vault) - 5 * 10 ** 8)
+    step()
+    first = st["k"].money_blocked()
+    clk["t"] += 600_001; step()
+    chk("ST18: на Core хранилища меньше, чем бухгалтерия + известное (G1 на настоящем reconcile): первый шаг — "
+        "g1_negative_transient без стопа, дольше окна подтверждения — стоп", first is None
+        and "G1" in (st["k"].money_blocked() or "") and "g1_negative_transient" in incidents(),
+        f"{first} -> {st['k'].money_blocked()}")
+    st["k"].close(); st["tx"].close(); W.close()
+
+
+def chain_time(chain, clk):
+    """Блок с меткой времени часов стенда (anvil идёт по своим часам; у keeper'а — часы стенда). Каждая транзакция
+    automine — блок с меткой +1 с, и шаг с десятком транзакций уводит цепь вперёд часов стенда: у живых HL и HyperEVM
+    часы общие, поэтому вперёд догоняются ЧАСЫ стенда, а не время блока назад (anvil этого и не позволит)."""
+    latest = int(chain.rpc("eth_getBlockByNumber", "latest", False)["timestamp"], 16)
+    if clk["t"] // 1000 <= latest:
+        clk["t"] = (latest + 1) * 1000
+    chain.rpc("evm_setNextBlockTimestamp", hex(clk["t"] // 1000)); chain.rpc("evm_mine")
+
+
+def DUMP_R(st) -> int:
+    return st["closed_R"] + sum(r for _, r, _ in st["snaps"].values())
+
+
+def _subseq(xs, want) -> bool:
+    it = iter(xs)
+    return all(any(x == w for x in it) for w in want)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["run"]:
+        raise SystemExit("usage: python contracts/diff/vault_keeper_stand.pytxt run")
+    raise SystemExit(run())
